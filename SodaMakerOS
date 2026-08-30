@@ -1,0 +1,1770 @@
+module SodaMakerOS
+
+# ============================================================
+# SODAMAKER.OS
+#
+# Pure Julia beverage-production control/simulation platform
+#
+# RAW INGREDIENTS
+#       │
+#       ▼
+# WATER SYSTEM
+#       │
+#       ▼
+# SYRUP / FLAVOUR DOSING
+#       │
+#       ▼
+# SWEETENER DOSING
+#       │
+#       ▼
+# MIXING
+#       │
+#       ▼
+# COOLING
+#       │
+#       ▼
+# CARBONATION
+#       │
+#       ▼
+# DISPENSE
+#
+# Designed as a software model / simulator.
+#
+# It does not directly drive pumps, pressure vessels,
+# heaters or CO₂ hardware.
+# ============================================================
+
+
+# ============================================================
+# VERSION
+# ============================================================
+
+const SOFTWARE_NAME = "SodaMaker.OS"
+const VERSION = v"1.0.0"
+
+
+# ============================================================
+# MACHINE STATES
+# ============================================================
+
+@enum MachineState begin
+
+    OFF
+
+    INITIALISING
+
+    READY
+
+    WATER_FILL
+
+    INGREDIENT_DOSING
+
+    MIXING
+
+    COOLING
+
+    CARBONATING
+
+    QUALITY_CHECK
+
+    DISPENSING
+
+    CLEANING
+
+    FAULT
+
+end
+
+
+# ============================================================
+# BEVERAGE TYPES
+# ============================================================
+
+@enum BeverageType begin
+
+    LEMONADE
+
+    COLA
+
+    ORANGE
+
+    LIME
+
+    GINGER_ALE
+
+    TONIC
+
+    SPARKLING_WATER
+
+    CUSTOM
+
+end
+
+
+# ============================================================
+# INGREDIENT TYPES
+# ============================================================
+
+@enum IngredientType begin
+
+    WATER
+
+    SUGAR
+
+    CITRIC_ACID
+
+    LEMON_FLAVOUR
+
+    LIME_FLAVOUR
+
+    ORANGE_FLAVOUR
+
+    COLA_FLAVOUR
+
+    GINGER_FLAVOUR
+
+    CARAMEL_COLOUR
+
+    NATURAL_COLOUR
+
+    SWEETENER
+
+end
+
+
+# ============================================================
+# INGREDIENT LOT
+# ============================================================
+
+mutable struct IngredientTank
+
+    ingredient::IngredientType
+
+    capacity_ml::Float64
+
+    remaining_ml::Float64
+
+end
+
+
+function IngredientTank(
+    ingredient::IngredientType,
+    capacity_ml::Real
+)
+
+    IngredientTank(
+
+        ingredient,
+
+        Float64(capacity_ml),
+
+        Float64(capacity_ml)
+
+    )
+
+end
+
+
+# ============================================================
+# RECIPE COMPONENT
+# ============================================================
+
+struct IngredientDose
+
+    ingredient::IngredientType
+
+    ml_per_litre::Float64
+
+end
+
+
+# ============================================================
+# RECIPE
+# ============================================================
+
+struct Recipe
+
+    name::String
+
+    beverage::BeverageType
+
+    sugar_g_per_litre::Float64
+
+    acidity_g_per_litre::Float64
+
+    carbonation_g_per_litre::Float64
+
+    target_temperature_c::Float64
+
+    ingredients::Vector{IngredientDose}
+
+end
+
+
+# ============================================================
+# RECIPE DATABASE
+# ============================================================
+
+const RECIPES = Dict{BeverageType,Recipe}()
+
+
+# ------------------------------------------------------------
+# LEMONADE
+# ------------------------------------------------------------
+
+RECIPES[LEMONADE] = Recipe(
+
+    "Classic Lemonade",
+
+    LEMONADE,
+
+    80.0,
+
+    4.0,
+
+    6.0,
+
+    4.0,
+
+    [
+
+        IngredientDose(
+            LEMON_FLAVOUR,
+            18.0
+        ),
+
+        IngredientDose(
+            CITRIC_ACID,
+            3.0
+        )
+
+    ]
+
+)
+
+
+# ------------------------------------------------------------
+# COLA
+# ------------------------------------------------------------
+
+RECIPES[COLA] = Recipe(
+
+    "Cola",
+
+    COLA,
+
+    95.0,
+
+    2.5,
+
+    7.0,
+
+    4.0,
+
+    [
+
+        IngredientDose(
+            COLA_FLAVOUR,
+            20.0
+        ),
+
+        IngredientDose(
+            CARAMEL_COLOUR,
+            4.0
+        ),
+
+        IngredientDose(
+            CITRIC_ACID,
+            2.0
+        )
+
+    ]
+
+)
+
+
+# ------------------------------------------------------------
+# ORANGE
+# ------------------------------------------------------------
+
+RECIPES[ORANGE] = Recipe(
+
+    "Orange Soda",
+
+    ORANGE,
+
+    85.0,
+
+    3.0,
+
+    6.5,
+
+    4.0,
+
+    [
+
+        IngredientDose(
+            ORANGE_FLAVOUR,
+            22.0
+        ),
+
+        IngredientDose(
+            NATURAL_COLOUR,
+            2.0
+        )
+
+    ]
+
+)
+
+
+# ------------------------------------------------------------
+# LIME
+# ------------------------------------------------------------
+
+RECIPES[LIME] = Recipe(
+
+    "Lime Soda",
+
+    LIME,
+
+    75.0,
+
+    4.0,
+
+    6.0,
+
+    4.0,
+
+    [
+
+        IngredientDose(
+            LIME_FLAVOUR,
+            18.0
+        ),
+
+        IngredientDose(
+            CITRIC_ACID,
+            3.0
+        )
+
+    ]
+
+)
+
+
+# ------------------------------------------------------------
+# GINGER ALE
+# ------------------------------------------------------------
+
+RECIPES[GINGER_ALE] = Recipe(
+
+    "Ginger Ale",
+
+    GINGER_ALE,
+
+    75.0,
+
+    2.5,
+
+    6.0,
+
+    4.0,
+
+    [
+
+        IngredientDose(
+            GINGER_FLAVOUR,
+            20.0
+        ),
+
+        IngredientDose(
+            CITRIC_ACID,
+            2.0
+        )
+
+    ]
+
+)
+
+
+# ------------------------------------------------------------
+# TONIC
+# ------------------------------------------------------------
+
+RECIPES[TONIC] = Recipe(
+
+    "Tonic Water",
+
+    TONIC,
+
+    65.0,
+
+    3.0,
+
+    7.0,
+
+    4.0,
+
+    [
+
+        IngredientDose(
+            LIME_FLAVOUR,
+            8.0
+        ),
+
+        IngredientDose(
+            CITRIC_ACID,
+            2.0
+        )
+
+    ]
+
+)
+
+
+# ------------------------------------------------------------
+# SPARKLING WATER
+# ------------------------------------------------------------
+
+RECIPES[SPARKLING_WATER] = Recipe(
+
+    "Sparkling Water",
+
+    SPARKLING_WATER,
+
+    0.0,
+
+    0.0,
+
+    7.0,
+
+    4.0,
+
+    IngredientDose[]
+
+)
+
+
+# ============================================================
+# WATER SYSTEM
+# ============================================================
+
+mutable struct WaterSystem
+
+    capacity_ml::Float64
+
+    available_ml::Float64
+
+    temperature_c::Float64
+
+    filtered::Bool
+
+end
+
+
+function WaterSystem(
+    capacity_ml::Real
+)
+
+    WaterSystem(
+
+        Float64(capacity_ml),
+
+        0.0,
+
+        20.0,
+
+        false
+
+    )
+
+end
+
+
+# ============================================================
+# CARBONATION SYSTEM
+# ============================================================
+
+mutable struct CarbonationSystem
+
+    enabled::Bool
+
+    target_co2_g_per_litre::Float64
+
+    actual_co2_g_per_litre::Float64
+
+end
+
+
+CarbonationSystem() =
+    CarbonationSystem(
+        true,
+        0.0,
+        0.0
+    )
+
+
+# ============================================================
+# QUALITY METRICS
+# ============================================================
+
+struct QualityReport
+
+    temperature_ok::Bool
+
+    sugar_ok::Bool
+
+    acidity_ok::Bool
+
+    carbonation_ok::Bool
+
+    ingredient_ok::Bool
+
+    overall::Bool
+
+end
+
+
+# ============================================================
+# BATCH
+# ============================================================
+
+mutable struct Batch
+
+    beverage::BeverageType
+
+    volume_ml::Float64
+
+    sugar_g::Float64
+
+    acidity_g::Float64
+
+    co2_g::Float64
+
+    temperature_c::Float64
+
+    flavour_score::Float64
+
+end
+
+
+# ============================================================
+# MACHINE
+# ============================================================
+
+mutable struct SodaMaker
+
+    state::MachineState
+
+    recipe::Recipe
+
+    water::WaterSystem
+
+    carbonation::CarbonationSystem
+
+    tanks::Dict{IngredientType,IngredientTank}
+
+    batch::Union{Nothing,Batch}
+
+    requested_volume_ml::Float64
+
+    elapsed_ms::UInt64
+
+    fault_message::String
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function SodaMaker()
+
+    tanks = Dict{IngredientType,IngredientTank}()
+
+    for ingredient in (
+
+        SUGAR,
+        CITRIC_ACID,
+        LEMON_FLAVOUR,
+        LIME_FLAVOUR,
+        ORANGE_FLAVOUR,
+        COLA_FLAVOUR,
+        GINGER_FLAVOUR,
+        CARAMEL_COLOUR,
+        NATURAL_COLOUR,
+        SWEETENER
+
+    )
+
+        tanks[ingredient] =
+            IngredientTank(
+                ingredient,
+                500.0
+            )
+
+    end
+
+
+    SodaMaker(
+
+        OFF,
+
+        RECIPES[LEMONADE],
+
+        WaterSystem(
+            2000.0
+        ),
+
+        CarbonationSystem(),
+
+        tanks,
+
+        nothing,
+
+        0.0,
+
+        UInt64(0),
+
+        ""
+
+    )
+
+end
+
+
+# ============================================================
+# SELECT RECIPE
+# ============================================================
+
+function select_recipe!(
+    machine::SodaMaker,
+    beverage::BeverageType
+)
+
+    if machine.state ∉ (
+        OFF,
+        READY
+    )
+
+        return false
+
+    end
+
+
+    machine.recipe =
+        RECIPES[beverage]
+
+
+    true
+
+end
+
+
+# ============================================================
+# WATER FILL
+# ============================================================
+
+function fill_water!(
+    machine::SodaMaker,
+    volume_ml::Real
+)
+
+    volume =
+        Float64(volume_ml)
+
+
+    if volume <= 0
+        return false
+    end
+
+
+    if volume >
+       machine.water.capacity_ml
+
+        return false
+
+    end
+
+
+    machine.water.available_ml =
+        volume
+
+
+    machine.water.filtered =
+        true
+
+
+    machine.water.temperature_c =
+        18.0
+
+
+    true
+
+end
+
+
+# ============================================================
+# INGREDIENT REQUIREMENTS
+# ============================================================
+
+function ingredient_requirements(
+    recipe::Recipe,
+    volume_ml::Real
+)
+
+    litres =
+        Float64(volume_ml) / 1000.0
+
+
+    requirements =
+        Dict{IngredientType,Float64}()
+
+
+    # Sugar is represented separately.
+
+    if recipe.sugar_g_per_litre > 0
+
+        # Approximate software dosing volume.
+
+        requirements[SUGAR] =
+            recipe.sugar_g_per_litre *
+            litres
+
+    end
+
+
+    # Acid.
+
+    if recipe.acidity_g_per_litre > 0
+
+        requirements[CITRIC_ACID] =
+            recipe.acidity_g_per_litre *
+            litres
+
+    end
+
+
+    for dose in recipe.ingredients
+
+        requirements[dose.ingredient] =
+            get(
+                requirements,
+                dose.ingredient,
+                0.0
+            ) +
+            dose.ml_per_litre *
+            litres
+
+    end
+
+
+    requirements
+
+end
+
+
+# ============================================================
+# INVENTORY CHECK
+# ============================================================
+
+function inventory_available(
+    machine::SodaMaker,
+    requirements
+)
+
+    for (
+        ingredient,
+        amount
+    ) in requirements
+
+        tank =
+            get(
+                machine.tanks,
+                ingredient,
+                nothing
+            )
+
+
+        if tank === nothing
+
+            return false
+
+        end
+
+
+        if tank.remaining_ml < amount
+
+            return false
+
+        end
+
+    end
+
+
+    true
+
+end
+
+
+# ============================================================
+# DOSE INGREDIENTS
+# ============================================================
+
+function dose_ingredients!(
+    machine::SodaMaker,
+    volume_ml::Real
+)
+
+    requirements =
+        ingredient_requirements(
+            machine.recipe,
+            volume_ml
+        )
+
+
+    if !inventory_available(
+        machine,
+        requirements
+    )
+
+        return false
+
+    end
+
+
+    for (
+        ingredient,
+        amount
+    ) in requirements
+
+        tank =
+            machine.tanks[
+                ingredient
+            ]
+
+
+        tank.remaining_ml -=
+            amount
+
+    end
+
+
+    true
+
+end
+
+
+# ============================================================
+# CREATE BATCH
+# ============================================================
+
+function create_batch!(
+    machine::SodaMaker
+)
+
+    volume =
+        machine.requested_volume_ml
+
+
+    recipe =
+        machine.recipe
+
+
+    litres =
+        volume / 1000.0
+
+
+    machine.batch =
+        Batch(
+
+            recipe.beverage,
+
+            volume,
+
+            recipe.sugar_g_per_litre *
+            litres,
+
+            recipe.acidity_g_per_litre *
+            litres,
+
+            0.0,
+
+            machine.water.temperature_c,
+
+            0.0
+
+        )
+
+end
+
+
+# ============================================================
+# MIX
+# ============================================================
+
+function mix!(
+    machine::SodaMaker
+)
+
+    batch =
+        machine.batch
+
+
+    batch === nothing &&
+        return false
+
+
+    # Abstract mixing model.
+
+    batch.flavour_score =
+        100.0
+
+
+    batch.temperature_c =
+        machine.water.temperature_c
+
+
+    true
+
+end
+
+
+# ============================================================
+# COOLING MODEL
+# ============================================================
+
+function cool!(
+    machine::SodaMaker
+)
+
+    batch =
+        machine.batch
+
+
+    batch === nothing &&
+        return false
+
+
+    target =
+        machine.recipe.target_temperature_c
+
+
+    # Simulated thermal convergence.
+
+    batch.temperature_c =
+        target
+
+
+    true
+
+end
+
+
+# ============================================================
+# CARBONATION
+# ============================================================
+
+function carbonate!(
+    machine::SodaMaker
+)
+
+    batch =
+        machine.batch
+
+
+    batch === nothing &&
+        return false
+
+
+    target =
+        machine.recipe.carbonation_g_per_litre
+
+
+    batch.co2_g =
+        target *
+        (batch.volume_ml / 1000.0)
+
+
+    machine.carbonation.target_co2_g_per_litre =
+        target
+
+
+    machine.carbonation.actual_co2_g_per_litre =
+        target
+
+
+    true
+
+end
+
+
+# ============================================================
+# QUALITY CONTROL
+# ============================================================
+
+function quality_check(
+    machine::SodaMaker
+)::QualityReport
+
+    batch =
+        machine.batch
+
+
+    batch === nothing &&
+        return QualityReport(
+            false,
+            false,
+            false,
+            false,
+            false,
+            false
+        )
+
+
+    recipe =
+        machine.recipe
+
+
+    temperature_ok =
+        abs(
+            batch.temperature_c -
+            recipe.target_temperature_c
+        ) <= 1.0
+
+
+    sugar_ok =
+        batch.sugar_g >= 0
+
+
+    acidity_ok =
+        batch.acidity_g >= 0
+
+
+    carbonation_target =
+        recipe.carbonation_g_per_litre
+
+
+    actual_carbonation =
+        batch.co2_g /
+        (batch.volume_ml / 1000.0)
+
+
+    carbonation_ok =
+        abs(
+            actual_carbonation -
+            carbonation_target
+        ) <= 0.5
+
+
+    ingredient_ok =
+        batch.flavour_score >= 90.0
+
+
+    overall =
+        temperature_ok &&
+        sugar_ok &&
+        acidity_ok &&
+        carbonation_ok &&
+        ingredient_ok
+
+
+    QualityReport(
+
+        temperature_ok,
+
+        sugar_ok,
+
+        acidity_ok,
+
+        carbonation_ok,
+
+        ingredient_ok,
+
+        overall
+
+    )
+
+end
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+function start!(
+    machine::SodaMaker
+)
+
+    if machine.state != OFF
+
+        return false
+
+    end
+
+
+    machine.state =
+        INITIALISING
+
+
+    machine.elapsed_ms =
+        UInt64(0)
+
+
+    machine.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# MAKE DRINK
+# ============================================================
+
+function make!(
+    machine::SodaMaker,
+    beverage::BeverageType,
+    volume_ml::Real
+)
+
+    # --------------------------------------------------------
+    # BASIC VALIDATION
+    # --------------------------------------------------------
+
+    if volume_ml <= 0
+
+        error(
+            "Volume must be positive"
+        )
+
+    end
+
+
+    if volume_ml >
+       machine.water.capacity_ml
+
+        error(
+            "Requested volume exceeds water capacity"
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # SELECT RECIPE
+    # --------------------------------------------------------
+
+    select_recipe!(
+        machine,
+        beverage
+    )
+
+
+    machine.requested_volume_ml =
+        Float64(volume_ml)
+
+
+    # --------------------------------------------------------
+    # WATER
+    # --------------------------------------------------------
+
+    machine.state =
+        WATER_FILL
+
+
+    if !fill_water!(
+        machine,
+        volume_ml
+    )
+
+        machine.state =
+            FAULT
+
+        machine.fault_message =
+            "Water system failure"
+
+        return false
+
+    end
+
+
+    # --------------------------------------------------------
+    # INGREDIENTS
+    # --------------------------------------------------------
+
+    machine.state =
+        INGREDIENT_DOSING
+
+
+    if !dose_ingredients!(
+        machine,
+        volume_ml
+    )
+
+        machine.state =
+            FAULT
+
+        machine.fault_message =
+            "Insufficient ingredient inventory"
+
+        return false
+
+    end
+
+
+    # --------------------------------------------------------
+    # BATCH
+    # --------------------------------------------------------
+
+    create_batch!(
+        machine
+    )
+
+
+    # --------------------------------------------------------
+    # MIX
+    # --------------------------------------------------------
+
+    machine.state =
+        MIXING
+
+
+    mix!(
+        machine
+    )
+
+
+    # --------------------------------------------------------
+    # COOL
+    # --------------------------------------------------------
+
+    machine.state =
+        COOLING
+
+
+    cool!(
+        machine
+    )
+
+
+    # --------------------------------------------------------
+    # CARBONATE
+    # --------------------------------------------------------
+
+    machine.state =
+        CARBONATING
+
+
+    if machine.recipe.carbonation_g_per_litre > 0
+
+        carbonate!(
+            machine
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # QUALITY
+    # --------------------------------------------------------
+
+    machine.state =
+        QUALITY_CHECK
+
+
+    report =
+        quality_check(
+            machine
+        )
+
+
+    if !report.overall
+
+        machine.state =
+            FAULT
+
+        machine.fault_message =
+            "Quality control failure"
+
+        return false
+
+    end
+
+
+    # --------------------------------------------------------
+    # DISPENSE
+    # --------------------------------------------------------
+
+    machine.state =
+        DISPENSING
+
+
+    machine.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# CLEANING
+# ============================================================
+
+function clean!(
+    machine::SodaMaker
+)
+
+    machine.state =
+        CLEANING
+
+
+    machine.batch =
+        nothing
+
+
+    machine.water.available_ml =
+        0.0
+
+
+    machine.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# FAULT RESET
+# ============================================================
+
+function reset_fault!(
+    machine::SodaMaker
+)
+
+    if machine.state != FAULT
+
+        return true
+
+    end
+
+
+    machine.fault_message =
+        ""
+
+
+    machine.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# BATCH REPORT
+# ============================================================
+
+function report(
+    machine::SodaMaker
+)
+
+    println()
+    println("============================================")
+    println("             SODAMAKER.OS")
+    println("             VERSION ", VERSION)
+    println("============================================")
+
+    println(
+        "STATE       : ",
+        machine.state
+    )
+
+    println(
+        "BEVERAGE    : ",
+        machine.recipe.name
+    )
+
+    println(
+        "VOLUME      : ",
+        machine.requested_volume_ml,
+        " ml"
+    )
+
+
+    if machine.batch !== nothing
+
+        batch =
+            machine.batch
+
+
+        println(
+            "TEMPERATURE : ",
+            batch.temperature_c,
+            " °C"
+        )
+
+        println(
+            "SUGAR       : ",
+            batch.sugar_g,
+            " g"
+        )
+
+        println(
+            "ACIDITY     : ",
+            batch.acidity_g,
+            " g"
+        )
+
+        println(
+            "CO₂         : ",
+            batch.co2_g,
+            " g"
+        )
+
+        println(
+            "FLAVOUR     : ",
+            batch.flavour_score,
+            "%"
+        )
+
+    end
+
+
+    if machine.state == FAULT
+
+        println(
+            "FAULT       : ",
+            machine.fault_message
+        )
+
+    end
+
+
+    println("============================================")
+
+end
+
+
+# ============================================================
+# INVENTORY REPORT
+# ============================================================
+
+function inventory_report(
+    machine::SodaMaker
+)
+
+    println()
+    println("INGREDIENT INVENTORY")
+    println("--------------------")
+
+
+    for (
+        ingredient,
+        tank
+    ) in sort(
+        collect(machine.tanks),
+        by = x -> string(x[1])
+    )
+
+        percentage =
+            100.0 *
+            tank.remaining_ml /
+            tank.capacity_ml
+
+
+        println(
+
+            rpad(
+                string(ingredient),
+                22
+            ),
+
+            lpad(
+                round(
+                    tank.remaining_ml,
+                    digits = 1
+                ),
+                10
+            ),
+
+            " ml   ",
+
+            round(
+                percentage,
+                digits = 1
+            ),
+
+            "%"
+
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# MACHINE SNAPSHOT
+# ============================================================
+
+struct MachineSnapshot
+
+    software::String
+
+    version::VersionNumber
+
+    state::MachineState
+
+    beverage::BeverageType
+
+    volume_ml::Float64
+
+    temperature_c::Float64
+
+    co2_g::Float64
+
+    quality_ok::Bool
+
+end
+
+
+function snapshot(
+    machine::SodaMaker
+)
+
+    batch =
+        machine.batch
+
+
+    if batch === nothing
+
+        return MachineSnapshot(
+
+            SOFTWARE_NAME,
+
+            VERSION,
+
+            machine.state,
+
+            machine.recipe.beverage,
+
+            machine.requested_volume_ml,
+
+            machine.water.temperature_c,
+
+            0.0,
+
+            false
+
+        )
+
+    end
+
+
+    quality =
+        quality_check(
+            machine
+        )
+
+
+    MachineSnapshot(
+
+        SOFTWARE_NAME,
+
+        VERSION,
+
+        machine.state,
+
+        batch.beverage,
+
+        batch.volume_ml,
+
+        batch.temperature_c,
+
+        batch.co2_g,
+
+        quality.overall
+
+    )
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    machine =
+        SodaMaker()
+
+
+    println(
+        "Starting ",
+        SOFTWARE_NAME
+    )
+
+
+    start!(
+        machine
+    )
+
+
+    # Make 500 ml of lemonade.
+
+    make!(
+        machine,
+        LEMONADE,
+        500
+    )
+
+
+    report(
+        machine
+    )
+
+
+    inventory_report(
+        machine
+    )
+
+
+    # --------------------------------------------------------
+    # COLA
+    # --------------------------------------------------------
+
+    make!(
+        machine,
+        COLA,
+        500
+    )
+
+
+    report(
+        machine
+    )
+
+
+    # --------------------------------------------------------
+    # ORANGE
+    # --------------------------------------------------------
+
+    make!(
+        machine,
+        ORANGE,
+        750
+    )
+
+
+    report(
+        machine
+    )
+
+
+    # --------------------------------------------------------
+    # CLEAN
+    # --------------------------------------------------------
+
+    clean!(
+        machine
+    )
+
+
+    println()
+    println(
+        "Machine state after cleaning: ",
+        machine.state
+    )
+
+end
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+function self_test()
+
+    machine =
+        SodaMaker()
+
+
+    @assert start!(
+        machine
+    )
+
+
+    @assert machine.state ==
+        READY
+
+
+    @assert select_recipe!(
+        machine,
+        LEMONADE
+    )
+
+
+    @assert make!(
+        machine,
+        LEMONADE,
+        500
+    )
+
+
+    @assert machine.state ==
+        READY
+
+
+    @assert machine.batch !== nothing
+
+
+    @assert machine.batch.beverage ==
+        LEMONADE
+
+
+    @assert machine.batch.temperature_c ==
+        4.0
+
+
+    @assert machine.batch.co2_g > 0
+
+
+    report =
+        quality_check(
+            machine
+        )
+
+
+    @assert report.overall
+
+
+    println(
+        "SodaMaker.OS SELF TEST: PASS"
+    )
+
+end
+
+
+end # module
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+using .SodaMakerOS
+
+SodaMakerOS.self_test()
+
+SodaMakerOS.demo()
