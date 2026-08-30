@@ -1,0 +1,3094 @@
+# PASTEOS
+
+## Intelligent Food-Paste Manufacturing Appliance
+
+### Complete Pure Julia Implementation
+
+```julia
+module PasteOS
+
+using Dates
+using Printf
+using Statistics
+
+
+# ============================================================
+# PASTEOS
+# ============================================================
+#
+# Intelligent automated food-paste appliance.
+#
+# Designed conceptually for:
+#
+#   TOMATO PASTE
+#   VEGETABLE PASTE
+#   FRUIT PASTE
+#   CURRY PASTE
+#   PEPPER PASTE
+#   GARLIC PASTE
+#   HERB PASTE
+#   SAUCE BASES
+#
+#
+# PROCESS
+#
+# INGREDIENTS
+#      │
+#      ▼
+#   DOSING
+#      │
+#      ▼
+#   CHOPPING
+#      │
+#      ▼
+#   GRINDING
+#      │
+#      ▼
+#   MIXING
+#      │
+#      ▼
+#   HEATING
+#      │
+#      ▼
+# CONCENTRATION
+#      │
+#      ▼
+# VISCOSITY CONTROL
+#      │
+#      ▼
+#   FINISHING
+#      │
+#      ▼
+#   COOLING
+#      │
+#      ▼
+#   COMPLETE
+#
+#
+# IMPORTANT:
+#
+# This is a control-system prototype / digital twin.
+#
+# It does NOT establish a validated food-preservation process.
+# Shelf-stable food production requires validated thermal,
+# pH, water-activity, sanitation and packaging processes.
+#
+# ============================================================
+
+
+# ============================================================
+# MACHINE STATES
+# ============================================================
+
+@enum PasteState begin
+
+    IDLE
+
+    DOSING
+
+    CHOPPING
+
+    GRINDING
+
+    MIXING
+
+    HEATING
+
+    CONCENTRATING
+
+    VISCOSITY_CONTROL
+
+    FINISHING
+
+    COOLING
+
+    COMPLETE
+
+    CLEANING
+
+    FAULT
+
+    EMERGENCY_STOP
+
+end
+
+
+# ============================================================
+# PASTE RECIPE
+# ============================================================
+
+struct PasteRecipe
+
+    name::String
+
+    target_mass_g::Float64
+
+    target_temperature_c::Float64
+
+    maximum_temperature_c::Float64
+
+    target_viscosity::Float64
+
+    minimum_pH::Float64
+
+    maximum_pH::Float64
+
+    chopping_time_s::Float64
+
+    grinding_time_s::Float64
+
+    mixing_time_s::Float64
+
+    concentration_time_s::Float64
+
+    finishing_time_s::Float64
+
+    cooling_target_c::Float64
+
+end
+
+
+function PasteRecipe(;
+
+    name="TOMATO PASTE",
+
+    target_mass_g=1000.0,
+
+    target_temperature_c=90.0,
+
+    maximum_temperature_c=98.0,
+
+    target_viscosity=0.90,
+
+    minimum_pH=2.5,
+
+    maximum_pH=4.2,
+
+    chopping_time_s=120.0,
+
+    grinding_time_s=180.0,
+
+    mixing_time_s=180.0,
+
+    concentration_time_s=900.0,
+
+    finishing_time_s=60.0,
+
+    cooling_target_c=30.0
+
+)
+
+    PasteRecipe(
+
+        name,
+
+        target_mass_g,
+
+        target_temperature_c,
+
+        maximum_temperature_c,
+
+        target_viscosity,
+
+        minimum_pH,
+
+        maximum_pH,
+
+        chopping_time_s,
+
+        grinding_time_s,
+
+        mixing_time_s,
+
+        concentration_time_s,
+
+        finishing_time_s,
+
+        cooling_target_c
+
+    )
+
+end
+
+
+# ============================================================
+# INGREDIENT SYSTEM
+# ============================================================
+
+mutable struct IngredientSystem
+
+    raw_mass_g::Float64
+
+    water_mass_g::Float64
+
+    solids_mass_g::Float64
+
+    oil_mass_g::Float64
+
+    salt_mass_g::Float64
+
+    acid_mass_g::Float64
+
+    loaded::Bool
+
+end
+
+
+function IngredientSystem()
+
+    IngredientSystem(
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        false
+
+    )
+
+end
+
+
+function load_ingredients!(
+
+    ingredients::IngredientSystem,
+
+    raw_mass_g::Float64,
+
+    water_mass_g::Float64,
+    oil_mass_g::Float64,
+    salt_mass_g::Float64,
+    acid_mass_g::Float64
+
+)
+
+    ingredients.raw_mass_g =
+        raw_mass_g
+
+    ingredients.water_mass_g =
+        water_mass_g
+
+    ingredients.oil_mass_g =
+        oil_mass_g
+
+    ingredients.salt_mass_g =
+        salt_mass_g
+
+    ingredients.acid_mass_g =
+        acid_mass_g
+
+
+    ingredients.solids_mass_g =
+
+        max(
+
+            raw_mass_g -
+            water_mass_g,
+
+            0.0
+
+        )
+
+
+    ingredients.loaded = true
+
+end
+
+
+# ============================================================
+# THERMAL SYSTEM
+# ============================================================
+
+mutable struct ThermalSystem
+
+    product_temperature_c::Float64
+
+    chamber_temperature_c::Float64
+
+    target_temperature_c::Float64
+
+    heater_power_percent::Float64
+
+    heater_enabled::Bool
+
+    ambient_temperature_c::Float64
+
+    maximum_temperature_c::Float64
+
+end
+
+
+function ThermalSystem(;
+
+    ambient_temperature_c=20.0,
+
+    maximum_temperature_c=105.0
+
+)
+
+    ThermalSystem(
+
+        ambient_temperature_c,
+
+        ambient_temperature_c,
+
+        ambient_temperature_c,
+
+        0.0,
+
+        false,
+
+        ambient_temperature_c,
+
+        maximum_temperature_c
+
+    )
+
+end
+
+
+function set_target_temperature!(
+
+    thermal::ThermalSystem,
+
+    temperature_c::Float64
+
+)
+
+    thermal.target_temperature_c =
+
+        clamp(
+
+            temperature_c,
+
+            thermal.ambient_temperature_c,
+
+            thermal.maximum_temperature_c
+
+        )
+
+end
+
+
+function update_thermal_system!(
+
+    thermal::ThermalSystem,
+
+    dt::Float64,
+
+    product_mass_g::Float64
+
+)
+
+    error =
+
+        thermal.target_temperature_c -
+        thermal.product_temperature_c
+
+
+    # Simple PID-like controller.
+
+    thermal.heater_power_percent =
+
+        clamp(
+
+            55.0 +
+            10.0 * error,
+
+            0.0,
+            100.0
+
+        )
+
+
+    thermal.heater_enabled =
+
+        thermal.heater_power_percent > 0.0
+
+
+    # Heater contribution.
+
+    heater_gain =
+
+        0.020 *
+        thermal.heater_power_percent
+
+
+    # Larger batches heat more slowly.
+
+    mass_factor =
+
+        1.0 /
+        max(
+
+            product_mass_g / 1000.0,
+
+            0.25
+
+        )
+
+
+    # Thermal losses.
+
+    thermal_loss =
+
+        max(
+
+            thermal.product_temperature_c -
+            thermal.ambient_temperature_c,
+
+            0.0
+
+        ) *
+        0.002
+
+
+    delta_temperature =
+
+        (
+
+            heater_gain *
+            mass_factor -
+
+            thermal_loss
+
+        ) * dt
+
+
+    thermal.product_temperature_c +=
+
+        delta_temperature
+
+
+    thermal.product_temperature_c =
+
+        clamp(
+
+            thermal.product_temperature_c,
+
+            thermal.ambient_temperature_c,
+
+            thermal.maximum_temperature_c
+
+        )
+
+
+    thermal.chamber_temperature_c +=
+
+        (
+
+            thermal.product_temperature_c -
+            thermal.chamber_temperature_c
+
+        ) *
+        0.03 *
+        dt
+
+end
+
+
+# ============================================================
+# MIXER
+# ============================================================
+
+mutable struct MixerSystem
+
+    motor_on::Bool
+
+    speed_percent::Float64
+
+    torque_nm::Float64
+
+    current_a::Float64
+
+    overload::Bool
+
+    maximum_current_a::Float64
+
+end
+
+
+function MixerSystem()
+
+    MixerSystem(
+
+        false,
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        false,
+
+        8.0
+
+    )
+
+end
+
+
+function set_mixer_speed!(
+
+    mixer::MixerSystem,
+
+    speed_percent::Float64
+
+)
+
+    mixer.speed_percent =
+
+        clamp(
+
+            speed_percent,
+
+            0.0,
+            100.0
+
+        )
+
+
+    mixer.motor_on =
+
+        mixer.speed_percent > 0.0
+
+end
+
+
+function update_mixer!(
+
+    mixer::MixerSystem,
+
+    viscosity::Float64
+
+)
+
+    speed_factor =
+
+        mixer.speed_percent /
+        100.0
+
+
+    mixer.torque_nm =
+
+        0.5 +
+        5.0 *
+        viscosity *
+        speed_factor
+
+
+    mixer.current_a =
+
+        0.8 +
+        1.2 *
+        mixer.torque_nm
+
+
+    mixer.overload =
+
+        mixer.current_a >
+        mixer.maximum_current_a
+
+end
+
+
+# ============================================================
+# GRINDER
+# ============================================================
+
+mutable struct GrinderSystem
+
+    motor_on::Bool
+
+    speed_percent::Float64
+
+    particle_size_mm::Float64
+
+    current_a::Float64
+
+end
+
+
+function GrinderSystem()
+
+    GrinderSystem(
+
+        false,
+
+        0.0,
+
+        12.0,
+
+        0.0
+
+    )
+
+end
+
+
+function set_grinder_speed!(
+
+    grinder::GrinderSystem,
+
+    speed_percent::Float64
+
+)
+
+    grinder.speed_percent =
+
+        clamp(
+
+            speed_percent,
+
+            0.0,
+            100.0
+
+        )
+
+
+    grinder.motor_on =
+
+        speed_percent > 0.0
+
+end
+
+
+function update_grinder!(
+
+    grinder::GrinderSystem,
+
+    dt::Float64
+
+)
+
+    if !grinder.motor_on
+
+        return
+
+    end
+
+
+    grinder.particle_size_mm *=
+
+        exp(
+
+            -0.003 *
+            grinder.speed_percent /
+            100.0 *
+            dt
+
+        )
+
+
+    grinder.particle_size_mm =
+
+        max(
+
+            grinder.particle_size_mm,
+
+            0.15
+
+        )
+
+
+    grinder.current_a =
+
+        0.5 +
+        2.5 *
+        grinder.speed_percent /
+        100.0
+
+end
+
+
+# ============================================================
+# PRODUCT MODEL
+# ============================================================
+
+mutable struct PasteProduct
+
+    mass_g::Float64
+
+    water_mass_g::Float64
+
+    solids_mass_g::Float64
+
+    viscosity::Float64
+
+    particle_size_mm::Float64
+
+    homogeneity::Float64
+
+    concentration::Float64
+
+    estimated_pH::Float64
+
+    temperature_c::Float64
+
+end
+
+
+function PasteProduct()
+
+    PasteProduct(
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        0.05,
+
+        12.0,
+
+        0.0,
+
+        0.0,
+
+        4.0,
+
+        20.0
+
+    )
+
+end
+
+
+function initialize_product!(
+
+    product::PasteProduct,
+
+    ingredients::IngredientSystem
+
+)
+
+    product.mass_g =
+
+        ingredients.raw_mass_g +
+        ingredients.water_mass_g +
+        ingredients.oil_mass_g +
+        ingredients.salt_mass_g +
+        ingredients.acid_mass_g
+
+
+    product.water_mass_g =
+
+        ingredients.water_mass_g
+
+
+    product.solids_mass_g =
+
+        ingredients.solids_mass_g +
+        ingredients.salt_mass_g +
+        ingredients.acid_mass_g
+
+
+    product.viscosity =
+        0.05
+
+
+    product.particle_size_mm =
+        12.0
+
+
+    product.homogeneity =
+        0.0
+
+
+    product.concentration =
+        ingredients.solids_mass_g /
+        max(
+            product.mass_g,
+            1.0
+        )
+
+
+    product.estimated_pH =
+        4.0
+
+end
+
+
+# ============================================================
+# CHOPPING
+# ============================================================
+
+function chop_product!(
+
+    product::PasteProduct,
+
+    grinder::GrinderSystem,
+
+    dt::Float64
+
+)
+
+    set_grinder_speed!(
+
+        grinder,
+
+        60.0
+
+    )
+
+
+    update_grinder!(
+
+        grinder,
+
+        dt
+
+    )
+
+
+    product.particle_size_mm =
+
+        grinder.particle_size_mm
+
+
+    product.homogeneity +=
+
+        0.002 *
+        dt
+
+
+    product.homogeneity =
+
+        clamp(
+
+            product.homogeneity,
+
+            0.0,
+            1.0
+
+        )
+
+end
+
+
+# ============================================================
+# GRINDING
+# ============================================================
+
+function grind_product!(
+
+    product::PasteProduct,
+
+    grinder::GrinderSystem,
+
+    dt::Float64
+
+)
+
+    set_grinder_speed!(
+
+        grinder,
+
+        85.0
+
+    )
+
+
+    update_grinder!(
+
+        grinder,
+
+        dt
+
+    )
+
+
+    product.particle_size_mm =
+
+        grinder.particle_size_mm
+
+
+    product.homogeneity +=
+
+        0.0035 *
+        dt
+
+
+    product.homogeneity =
+
+        clamp(
+
+            product.homogeneity,
+
+            0.0,
+            1.0
+
+        )
+
+
+    # Smaller particles increase apparent viscosity.
+
+    product.viscosity +=
+
+        0.0002 *
+        dt
+
+
+    product.viscosity =
+
+        clamp(
+
+            product.viscosity,
+
+            0.0,
+            1.0
+
+        )
+
+end
+
+
+# ============================================================
+# MIXING
+# ============================================================
+
+function mix_product!(
+
+    product::PasteProduct,
+
+    mixer::MixerSystem,
+
+    dt::Float64
+
+)
+
+    set_mixer_speed!(
+
+        mixer,
+
+        55.0
+
+    )
+
+
+    update_mixer!(
+
+        mixer,
+
+        product.viscosity
+
+    )
+
+
+    product.homogeneity +=
+
+        0.0025 *
+        mixer.speed_percent /
+        100.0 *
+        dt
+
+
+    product.homogeneity =
+
+        clamp(
+
+            product.homogeneity,
+
+            0.0,
+            1.0
+
+        )
+
+
+    # Mixing slightly increases temperature.
+
+    product.temperature_c +=
+
+        0.0005 *
+        mixer.speed_percent *
+        dt
+
+end
+
+
+# ============================================================
+# CONCENTRATION MODEL
+# ============================================================
+
+function concentrate_product!(
+
+    product::PasteProduct,
+
+    thermal::ThermalSystem,
+
+    mixer::MixerSystem,
+
+    dt::Float64
+
+)
+
+    set_mixer_speed!(
+
+        mixer,
+
+        65.0
+
+    )
+
+
+    update_mixer!(
+
+        mixer,
+
+        product.viscosity
+
+    )
+
+
+    # Evaporation model.
+    #
+    # This is a simplified digital-twin model,
+    # NOT a validated food process.
+
+    temperature_factor =
+
+        clamp(
+
+            (
+
+                product.temperature_c -
+                60.0
+
+            ) / 35.0,
+
+            0.0,
+            1.0
+
+        )
+
+
+    evaporation_rate =
+
+        0.00035 *
+        temperature_factor
+
+
+    evaporated =
+
+        product.water_mass_g *
+        evaporation_rate *
+        dt
+
+
+    product.water_mass_g =
+
+        max(
+
+            product.water_mass_g -
+            evaporated,
+
+            0.0
+
+        )
+
+
+    product.mass_g =
+
+        product.water_mass_g +
+        product.solids_mass_g
+
+
+    product.concentration =
+
+        product.solids_mass_g /
+        max(
+            product.mass_g,
+            1.0
+        )
+
+
+    # Approximate viscosity response.
+
+    product.viscosity =
+
+        clamp(
+
+            0.05 +
+            1.35 *
+            product.concentration *
+            product.homogeneity,
+
+            0.0,
+            1.0
+
+        )
+
+end
+
+
+# ============================================================
+# VISCOSITY SENSOR
+# ============================================================
+
+mutable struct ViscositySensor
+
+    viscosity_index::Float64
+
+    filtered_value::Float64
+
+    sensor_noise::Float64
+
+end
+
+
+function ViscositySensor()
+
+    ViscositySensor(
+
+        0.0,
+
+        0.0,
+
+        0.01
+
+    )
+
+end
+
+
+function read_viscosity!(
+
+    sensor::ViscositySensor,
+
+    product::PasteProduct
+
+)
+
+    sensor.viscosity_index =
+
+        product.viscosity
+
+
+    sensor.filtered_value =
+
+        0.85 *
+        sensor.filtered_value +
+
+        0.15 *
+        sensor.viscosity_index
+
+
+    sensor.filtered_value
+
+end
+
+
+# ============================================================
+# pH SENSOR
+# ============================================================
+
+mutable struct PHSensor
+
+    pH::Float64
+
+end
+
+
+PHSensor() =
+    PHSensor(4.0)
+
+
+function read_pH!(
+
+    sensor::PHSensor,
+
+    product::PasteProduct
+
+)
+
+    sensor.pH =
+        product.estimated_pH
+
+    sensor.pH
+
+end
+
+
+# ============================================================
+# SAFETY
+# ============================================================
+
+mutable struct SafetySystem
+
+    lid_closed::Bool
+
+    vessel_locked::Bool
+
+    grinder_guard_closed::Bool
+
+    mixer_guard_closed::Bool
+
+    motor_overload::Bool
+
+    overtemperature::Bool
+
+    emergency_stop::Bool
+
+    maximum_temperature_c::Float64
+
+end
+
+
+function SafetySystem()
+
+    SafetySystem(
+
+        true,
+        true,
+        true,
+        true,
+        false,
+        false,
+        false,
+        103.0
+
+    )
+
+end
+
+
+function check_safety!(
+
+    safety::SafetySystem,
+
+    mixer::MixerSystem,
+
+    grinder::GrinderSystem,
+
+    thermal::ThermalSystem
+
+)
+
+    safety.motor_overload =
+
+        mixer.overload
+
+
+    safety.overtemperature =
+
+        thermal.product_temperature_c >=
+        safety.maximum_temperature_c
+
+
+    if !safety.lid_closed ||
+       !safety.vessel_locked ||
+       !safety.grinder_guard_closed ||
+       !safety.mixer_guard_closed ||
+       safety.motor_overload ||
+       safety.overtemperature ||
+       safety.emergency_stop
+
+        return false
+
+    end
+
+
+    true
+
+end
+
+
+# ============================================================
+# BATCH / TRACEABILITY
+# ============================================================
+
+struct BatchRecord
+
+    batch_id::String
+
+    started_at::DateTime
+
+    recipe_name::String
+
+    initial_mass_g::Float64
+
+end
+
+
+function create_batch(
+
+    recipe::PasteRecipe,
+
+    mass_g::Float64
+
+)
+
+    BatchRecord(
+
+        "PASTE-" *
+
+        Dates.format(
+
+            now(),
+
+            "yyyymmdd-HHMMSS"
+
+        ),
+
+        now(),
+
+        recipe.name,
+
+        mass_g
+
+    )
+
+end
+
+
+# ============================================================
+# TELEMETRY
+# ============================================================
+
+struct TelemetryPoint
+
+    timestamp::DateTime
+
+    state::PasteState
+
+    mass_g::Float64
+
+    temperature_c::Float64
+
+    viscosity::Float64
+
+    concentration::Float64
+
+    homogeneity::Float64
+
+    particle_size_mm::Float64
+
+    motor_current_a::Float64
+
+    pH::Float64
+
+end
+
+
+mutable struct Telemetry
+
+    points::Vector{TelemetryPoint}
+
+end
+
+
+Telemetry() =
+
+    Telemetry(
+
+        TelemetryPoint[]
+
+    )
+
+
+function record_telemetry!(
+
+    telemetry::Telemetry,
+
+    machine
+
+)
+
+    push!(
+
+        telemetry.points,
+
+        TelemetryPoint(
+
+            now(),
+
+            machine.state,
+
+            machine.product.mass_g,
+
+            machine.product.temperature_c,
+
+            machine.product.viscosity,
+
+            machine.product.concentration,
+
+            machine.product.homogeneity,
+
+            machine.product.particle_size_mm,
+
+            max(
+
+                machine.mixer.current_a,
+
+                machine.grinder.current_a
+
+            ),
+
+            machine.ph_sensor.pH
+
+        )
+
+    )
+
+end
+
+
+# ============================================================
+# PASTEOS MACHINE
+# ============================================================
+
+mutable struct PasteMachine
+
+    name::String
+
+    state::PasteState
+
+    recipe::PasteRecipe
+
+    ingredients::IngredientSystem
+
+    product::PasteProduct
+
+    thermal::ThermalSystem
+
+    mixer::MixerSystem
+
+    grinder::GrinderSystem
+
+    viscosity_sensor::ViscositySensor
+
+    ph_sensor::PHSensor
+
+    safety::SafetySystem
+
+    telemetry::Telemetry
+
+    batch::Union{Nothing,BatchRecord}
+
+    elapsed::Float64
+
+    state_elapsed::Float64
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function PasteMachine(
+
+    name::String="PASTEOS-001",
+
+    recipe::PasteRecipe=PasteRecipe()
+
+)
+
+    PasteMachine(
+
+        name,
+
+        IDLE,
+
+        recipe,
+
+        IngredientSystem(),
+
+        PasteProduct(),
+
+        ThermalSystem(),
+
+        MixerSystem(),
+
+        GrinderSystem(),
+
+        ViscositySensor(),
+
+        PHSensor(),
+
+        SafetySystem(),
+
+        Telemetry(),
+
+        nothing,
+
+        0.0,
+
+        0.0
+
+    )
+
+end
+
+
+# ============================================================
+# START BATCH
+# ============================================================
+
+function start_batch!(
+
+    machine::PasteMachine,
+
+    raw_mass_g::Float64,
+
+    water_mass_g::Float64
+
+)
+
+    machine.state == IDLE ||
+        error(
+
+            "PASTEOS must be idle."
+
+        )
+
+
+    load_ingredients!(
+
+        machine.ingredients,
+
+        raw_mass_g,
+
+        water_mass_g,
+
+        0.0,
+
+        5.0,
+
+        0.0
+
+    )
+
+
+    initialize_product!(
+
+        machine.product,
+
+        machine.ingredients
+
+    )
+
+
+    machine.batch =
+
+        create_batch(
+
+            machine.recipe,
+
+            machine.product.mass_g
+
+        )
+
+
+    machine.state =
+        DOSING
+
+
+    machine.elapsed =
+        0.0
+
+
+    machine.state_elapsed =
+        0.0
+
+end
+
+
+# ============================================================
+# DOSING
+# ============================================================
+
+function dosing_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed += dt
+
+
+    if machine.state_elapsed >= 5.0
+
+        machine.state =
+            CHOPPING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# CHOPPING
+# ============================================================
+
+function chopping_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    chop_product!(
+
+        machine.product,
+
+        machine.grinder,
+
+        dt
+
+    )
+
+
+    machine.state_elapsed += dt
+
+
+    if machine.state_elapsed >=
+
+       machine.recipe.chopping_time_s
+
+        machine.state =
+            GRINDING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# GRINDING
+# ============================================================
+
+function grinding_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    grind_product!(
+
+        machine.product,
+
+        machine.grinder,
+
+        dt
+
+    )
+
+
+    machine.state_elapsed += dt
+
+
+    if machine.state_elapsed >=
+
+       machine.recipe.grinding_time_s
+
+        machine.state =
+            MIXING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# MIXING
+# ============================================================
+
+function mixing_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    mix_product!(
+
+        machine.product,
+
+        machine.mixer,
+
+        dt
+
+    )
+
+
+    machine.state_elapsed += dt
+
+
+    if machine.state_elapsed >=
+
+       machine.recipe.mixing_time_s
+
+        machine.state =
+            HEATING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# HEATING
+# ============================================================
+
+function heating_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    set_target_temperature!(
+
+        machine.thermal,
+
+        machine.recipe.target_temperature_c
+
+    )
+
+
+    update_thermal_system!(
+
+        machine.thermal,
+
+        dt,
+
+        machine.product.mass_g
+
+    )
+
+
+    machine.product.temperature_c =
+
+        machine.thermal.product_temperature_c
+
+
+    machine.state_elapsed += dt
+
+
+    if machine.product.temperature_c >=
+
+       machine.recipe.target_temperature_c - 1.0
+
+        machine.state =
+            CONCENTRATING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# CONCENTRATION
+# ============================================================
+
+function concentration_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    set_target_temperature!(
+
+        machine.thermal,
+
+        machine.recipe.target_temperature_c
+
+    )
+
+
+    update_thermal_system!(
+
+        machine.thermal,
+
+        dt,
+
+        machine.product.mass_g
+
+    )
+
+
+    machine.product.temperature_c =
+
+        machine.thermal.product_temperature_c
+
+
+    concentrate_product!(
+
+        machine.product,
+
+        machine.thermal,
+
+        machine.mixer,
+
+        dt
+
+    )
+
+
+    machine.state_elapsed += dt
+
+
+    viscosity =
+
+        read_viscosity!(
+
+            machine.viscosity_sensor,
+
+            machine.product
+
+        )
+
+
+    # Adaptive concentration:
+    #
+    # Don't simply stop because the timer expired.
+    # Continue until the target rheological state is reached,
+    # subject to a maximum process time.
+
+    if viscosity >=
+
+       machine.recipe.target_viscosity
+
+        machine.state =
+            VISCOSITY_CONTROL
+
+        machine.state_elapsed =
+            0.0
+
+    elseif machine.state_elapsed >=
+
+           machine.recipe.concentration_time_s
+
+        machine.state =
+            VISCOSITY_CONTROL
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# VISCOSITY CONTROL
+# ============================================================
+
+function viscosity_control_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    viscosity =
+
+        read_viscosity!(
+
+            machine.viscosity_sensor,
+
+            machine.product
+
+        )
+
+
+    error =
+
+        machine.recipe.target_viscosity -
+        viscosity
+
+
+    if error > 0.03
+
+        # Still too thin.
+
+        set_mixer_speed!(
+
+            machine.mixer,
+
+            70.0
+
+        )
+
+
+        set_target_temperature!(
+
+            machine.thermal,
+
+            machine.recipe.target_temperature_c
+
+        )
+
+
+        update_thermal_system!(
+
+            machine.thermal,
+
+            dt,
+
+            machine.product.mass_g
+
+        )
+
+
+        machine.product.temperature_c =
+
+            machine.thermal.product_temperature_c
+
+
+        concentrate_product!(
+
+            machine.product,
+
+            machine.thermal,
+
+            machine.mixer,
+
+            dt
+
+        )
+
+    else
+
+        set_mixer_speed!(
+
+            machine.mixer,
+
+            25.0
+
+        )
+
+
+        machine.state_elapsed += dt
+
+    end
+
+
+    if abs(error) <= 0.03 ||
+
+       machine.state_elapsed >= 60.0
+
+        machine.state =
+            FINISHING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# FINISHING
+# ============================================================
+
+function finishing_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    set_mixer_speed!(
+
+        machine.mixer,
+
+        20.0
+
+    )
+
+
+    update_mixer!(
+
+        machine.mixer,
+
+        machine.product.viscosity
+
+    )
+
+
+    machine.product.homogeneity +=
+
+        0.001 *
+        dt
+
+
+    machine.product.homogeneity =
+
+        clamp(
+
+            machine.product.homogeneity,
+
+            0.0,
+            1.0
+
+        )
+
+
+    machine.state_elapsed += dt
+
+
+    if machine.state_elapsed >=
+
+       machine.recipe.finishing_time_s
+
+        machine.state =
+            COOLING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# COOLING
+# ============================================================
+
+function cooling_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64
+
+)
+
+    set_mixer_speed!(
+
+        machine.mixer,
+
+        15.0
+
+    )
+
+
+    machine.thermal.target_temperature_c =
+
+        machine.thermal.ambient_temperature_c
+
+
+    update_thermal_system!(
+
+        machine.thermal,
+
+        dt,
+
+        machine.product.mass_g
+
+    )
+
+
+    machine.product.temperature_c =
+
+        machine.thermal.product_temperature_c
+
+
+    machine.state_elapsed += dt
+
+
+    if machine.product.temperature_c <=
+
+       machine.recipe.cooling_target_c
+
+        machine.state =
+            COMPLETE
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# EMERGENCY STOP
+# ============================================================
+
+function emergency_stop!(
+
+    machine::PasteMachine
+
+)
+
+    set_mixer_speed!(
+        machine.mixer,
+        0.0
+    )
+
+
+    set_grinder_speed!(
+        machine.grinder,
+        0.0
+    )
+
+
+    machine.thermal.heater_enabled =
+        false
+
+
+    machine.thermal.heater_power_percent =
+        0.0
+
+
+    machine.safety.emergency_stop =
+        true
+
+
+    machine.state =
+        EMERGENCY_STOP
+
+end
+
+
+# ============================================================
+# MASTER CONTROL LOOP
+# ============================================================
+
+function control_step!(
+
+    machine::PasteMachine,
+
+    dt::Float64=1.0
+
+)
+
+    machine.state in (
+
+        IDLE,
+        COMPLETE,
+        FAULT,
+        EMERGENCY_STOP
+
+    ) && return
+
+
+    # ----------------------------------------
+    # Safety interlock
+    # ----------------------------------------
+
+    if !check_safety!(
+
+        machine.safety,
+
+        machine.mixer,
+
+        machine.grinder,
+
+        machine.thermal
+
+    )
+
+        emergency_stop!(
+            machine
+        )
+
+        return
+
+    end
+
+
+    # ----------------------------------------
+    # State machine
+    # ----------------------------------------
+
+    if machine.state == DOSING
+
+        dosing_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == CHOPPING
+
+        chopping_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == GRINDING
+
+        grinding_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == MIXING
+
+        mixing_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == HEATING
+
+        heating_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == CONCENTRATING
+
+        concentration_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == VISCOSITY_CONTROL
+
+        viscosity_control_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == FINISHING
+
+        finishing_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == COOLING
+
+        cooling_step!(
+            machine,
+            dt
+        )
+
+    end
+
+
+    # ----------------------------------------
+    # Sensors
+    # ----------------------------------------
+
+    read_pH!(
+
+        machine.ph_sensor,
+
+        machine.product
+
+    )
+
+
+    # ----------------------------------------
+    # Telemetry
+    # ----------------------------------------
+
+    record_telemetry!(
+
+        machine.telemetry,
+
+        machine
+
+    )
+
+
+    machine.elapsed += dt
+
+end
+
+
+# ============================================================
+# CLEANING SYSTEM
+# ============================================================
+
+function cleaning_cycle!(
+
+    machine::PasteMachine
+
+)
+
+    machine.state in (
+
+        IDLE,
+        COMPLETE
+
+    ) || error(
+
+        "Cleaning can only begin when the process is stopped."
+
+    )
+
+
+    machine.state =
+        CLEANING
+
+
+    println(
+        "PASTEOS CLEANING CYCLE"
+    )
+
+
+    println(
+        "1. Drain product chamber"
+    )
+
+
+    println(
+        "2. Flush product-contact surfaces"
+    )
+
+
+    println(
+        "3. Wash mixing chamber"
+    )
+
+
+    println(
+        "4. Clean grinding assembly"
+    )
+
+
+    println(
+        "5. Rinse"
+    )
+
+
+    println(
+        "6. Verify clean state"
+    )
+
+
+    machine.state =
+        IDLE
+
+end
+
+
+# ============================================================
+# QUALITY SCORE
+# ============================================================
+
+function quality_score(
+
+    machine::PasteMachine
+
+)
+
+    viscosity_score =
+
+        1.0 -
+
+        min(
+
+            abs(
+
+                machine.product.viscosity -
+                machine.recipe.target_viscosity
+
+            ),
+
+            1.0
+
+        )
+
+
+    particle_score =
+
+        1.0 -
+
+        min(
+
+            machine.product.particle_size_mm /
+            12.0,
+
+            1.0
+
+        )
+
+
+    homogeneity_score =
+
+        machine.product.homogeneity
+
+
+    concentration_score =
+
+        min(
+
+            machine.product.concentration /
+            0.30,
+
+            1.0
+
+        )
+
+
+    score =
+
+        100.0 *
+
+        (
+
+            0.35 *
+            viscosity_score +
+
+            0.25 *
+            particle_score +
+
+            0.25 *
+            homogeneity_score +
+
+            0.15 *
+            concentration_score
+
+        )
+
+
+    clamp(
+
+        score,
+
+        0.0,
+
+        100.0
+
+    )
+
+end
+
+
+# ============================================================
+# STATUS DISPLAY
+# ============================================================
+
+function display_status!(
+
+    machine::PasteMachine
+
+)
+
+    println(
+
+        @sprintf(
+
+            "%-20s | TEMP %6.1f°C | MASS %7.1f g | VISC %5.1f%% | SOLIDS %5.1f%% | PARTICLE %5.2f mm | HOMOG %5.1f%%",
+
+            string(machine.state),
+
+            machine.product.temperature_c,
+
+            machine.product.mass_g,
+
+            machine.product.viscosity * 100,
+
+            machine.product.concentration * 100,
+
+            machine.product.particle_size_mm,
+
+            machine.product.homogeneity * 100
+
+        )
+
+    )
+
+end
+
+
+# ============================================================
+# BATCH REPORT
+# ============================================================
+
+function batch_report(
+
+    machine::PasteMachine
+
+)
+
+    return (
+
+        batch_id =
+            machine.batch === nothing ?
+
+            "NONE" :
+
+            machine.batch.batch_id,
+
+        recipe =
+            machine.recipe.name,
+
+        starting_mass_g =
+            machine.batch === nothing ?
+
+            0.0 :
+
+            machine.batch.initial_mass_g,
+
+        final_mass_g =
+            machine.product.mass_g,
+
+        water_remaining_g =
+            machine.product.water_mass_g,
+
+        solids_g =
+            machine.product.solids_mass_g,
+
+        concentration =
+            machine.product.concentration,
+
+        viscosity =
+            machine.product.viscosity,
+
+        particle_size_mm =
+            machine.product.particle_size_mm,
+
+        homogeneity =
+            machine.product.homogeneity,
+
+        temperature_c =
+            machine.product.temperature_c,
+
+        estimated_pH =
+            machine.ph_sensor.pH,
+
+        quality_score =
+            quality_score(machine),
+
+        processing_time_min =
+            machine.elapsed / 60.0,
+
+        telemetry_points =
+            length(
+                machine.telemetry.points
+            )
+
+    )
+
+end
+
+
+# ============================================================
+# RECIPE LIBRARY
+# ============================================================
+
+const RECIPES = Dict(
+
+    "TOMATO" => PasteRecipe(
+
+        name="TOMATO PASTE",
+
+        target_mass_g=1000.0,
+
+        target_temperature_c=90.0,
+
+        maximum_temperature_c=98.0,
+
+        target_viscosity=0.90,
+
+        chopping_time_s=120.0,
+
+        grinding_time_s=180.0,
+
+        mixing_time_s=180.0,
+
+        concentration_time_s=900.0
+
+    ),
+
+
+    "PEPPER" => PasteRecipe(
+
+        name="RED PEPPER PASTE",
+
+        target_mass_g=1000.0,
+
+        target_temperature_c=88.0,
+
+        maximum_temperature_c=96.0,
+
+        target_viscosity=0.88,
+
+        chopping_time_s=120.0,
+
+        grinding_time_s=240.0,
+
+        mixing_time_s=180.0,
+
+        concentration_time_s=720.0
+
+    ),
+
+
+    "CURRY" => PasteRecipe(
+
+        name="CURRY PASTE",
+
+        target_mass_g=1000.0,
+
+        target_temperature_c=85.0,
+
+        maximum_temperature_c=95.0,
+
+        target_viscosity=0.82,
+
+        chopping_time_s=180.0,
+
+        grinding_time_s=240.0,
+
+        mixing_time_s=300.0,
+
+        concentration_time_s=600.0
+
+    ),
+
+
+    "GARLIC" => PasteRecipe(
+
+        name="GARLIC PASTE",
+
+        target_mass_g=500.0,
+
+        target_temperature_c=75.0,
+
+        maximum_temperature_c=90.0,
+
+        target_viscosity=0.86,
+
+        chopping_time_s=90.0,
+
+        grinding_time_s=180.0,
+
+        mixing_time_s=120.0,
+
+        concentration_time_s=300.0
+
+    )
+
+)
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    println()
+    println("="^125)
+
+    println(
+        "                              PASTEOS"
+    )
+
+    println(
+        "                  INTELLIGENT FOOD-PASTE APPLIANCE"
+    )
+
+    println("="^125)
+
+
+    recipe =
+
+        RECIPES["TOMATO"]
+
+
+    machine =
+
+        PasteMachine(
+
+            "PASTEOS-HOME-001",
+
+            recipe
+
+        )
+
+
+    println()
+
+    println(
+        "RECIPE: ",
+        recipe.name
+    )
+
+
+    println(
+        "TARGET VISCOSITY: ",
+
+        recipe.target_viscosity * 100,
+
+        "%"
+    )
+
+
+    println(
+        "TARGET TEMPERATURE: ",
+
+        recipe.target_temperature_c,
+
+        " °C"
+    )
+
+
+    println()
+
+    println(
+        "LOADING BATCH..."
+    )
+
+
+    # Example raw ingredient load.
+
+    start_batch!(
+
+        machine,
+
+        1500.0,
+
+        500.0
+
+    )
+
+
+    println(
+        "BATCH: ",
+        machine.batch.batch_id
+    )
+
+
+    println()
+    println(
+        "PROCESS START"
+    )
+
+
+    # Simulated controller.
+
+    for second in 1:10000
+
+        control_step!(
+
+            machine,
+
+            1.0
+
+        )
+
+
+        if second % 60 == 0
+
+            display_status!(
+                machine
+            )
+
+        end
+
+
+        if machine.state ==
+           COMPLETE
+
+            break
+
+        end
+
+
+        if machine.state ==
+           EMERGENCY_STOP
+
+            println(
+                "EMERGENCY STOP"
+            )
+
+            break
+
+        end
+
+    end
+
+
+    final =
+
+        batch_report(
+            machine
+        )
+
+
+    println()
+
+    println("="^125)
+
+    println(
+        "                            BATCH COMPLETE"
+    )
+
+    println("="^125)
+
+
+    println(
+        "Batch ID: ",
+        final.batch_id
+    )
+
+
+    println(
+        "Final mass: ",
+
+        round(
+
+            final.final_mass_g,
+
+            digits=1
+
+        ),
+
+        " g"
+    )
+
+
+    println(
+        "Water remaining: ",
+
+        round(
+
+            final.water_remaining_g,
+
+            digits=1
+
+        ),
+
+        " g"
+    )
+
+
+    println(
+        "Solids: ",
+
+        round(
+
+            final.solids_g,
+
+            digits=1
+
+        ),
+
+        " g"
+    )
+
+
+    println(
+        "Concentration: ",
+
+        round(
+
+            final.concentration * 100,
+
+            digits=1
+
+        ),
+
+        "%"
+    )
+
+
+    println(
+        "Viscosity: ",
+
+        round(
+
+            final.viscosity * 100,
+
+            digits=1
+
+        ),
+
+        "%"
+    )
+
+
+    println(
+        "Particle size: ",
+
+        round(
+
+            final.particle_size_mm,
+
+            digits=2
+
+        ),
+
+        " mm"
+    )
+
+
+    println(
+        "Homogeneity: ",
+
+        round(
+
+            final.homogeneity * 100,
+
+            digits=1
+
+        ),
+
+        "%"
+    )
+
+
+    println(
+        "Estimated pH: ",
+
+        round(
+
+            final.estimated_pH,
+
+            digits=2
+
+        )
+    )
+
+
+    println(
+        "Quality score: ",
+
+        round(
+
+            final.quality_score,
+
+            digits=1
+
+        ),
+
+        " / 100"
+    )
+
+
+    println(
+        "Processing time: ",
+
+        round(
+
+            final.processing_time_min,
+
+            digits=1
+
+        ),
+
+        " minutes"
+    )
+
+
+    println(
+        "Telemetry samples: ",
+
+        final.telemetry_points
+    )
+
+
+    println("="^125)
+
+end
+
+
+# ============================================================
+# EXPORTS
+# ============================================================
+
+export PasteState
+
+export IDLE
+export DOSING
+export CHOPPING
+export GRINDING
+export MIXING
+export HEATING
+export CONCENTRATING
+export VISCOSITY_CONTROL
+export FINISHING
+export COOLING
+export COMPLETE
+export CLEANING
+export FAULT
+export EMERGENCY_STOP
+
+export PasteRecipe
+export IngredientSystem
+export ThermalSystem
+export MixerSystem
+export GrinderSystem
+export PasteProduct
+export ViscositySensor
+export PHSensor
+export SafetySystem
+export BatchRecord
+export Telemetry
+export TelemetryPoint
+export PasteMachine
+
+export RECIPES
+
+export start_batch!
+export control_step!
+export emergency_stop!
+export cleaning_cycle!
+export quality_score
+export batch_report
+export display_status!
+export demo
+
+
+end # module
+
+
+# ============================================================
+# APPLICATION ENTRY POINT
+# ============================================================
+
+if abspath(PROGRAM_FILE) == @__FILE__
+
+    using .PasteOS
+
+    PasteOS.demo()
+
+end
+```
+
+
