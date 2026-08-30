@@ -1140,3 +1140,67 @@ run_generation!(
 breeding_report(
     program
 )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                    MusaBreed.jl
+                         │
+       ┌─────────────────┼─────────────────┐
+       │                 │                 │
+       ▼                 ▼                 ▼
+   GERMPLASM          GENOMICS         PHENOTYPES
+       │                 │                 │
+       └─────────────────┼─────────────────┘
+                         ▼
+                  BREEDING MODEL
+                         │
+             ┌───────────┼───────────┐
+             ▼           ▼           ▼
+           YIELD       DISEASE     QUALITY
+             │           │           │
+             └───────────┼───────────┘
+                         ▼
+                  GEBV PREDICTION
+                         │
+                         ▼
+                  CROSS OPTIMIZER
+                         │
+                         ▼
+              ┌────────────────────┐
+              │ BEST PARENT PAIRS  │
+              └─────────┬──────────┘
+                        ▼
+                   OFFSPRING
+                        │
+                        ▼
+                 FIELD TRIALS
+                        │
+                        ▼
+                   PHENOTYPING
+                        │
+                        ▼
+                   NEW DATA
+                        │
+                        └──────────► MODEL UPDATE
