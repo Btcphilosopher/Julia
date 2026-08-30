@@ -1,0 +1,1832 @@
+module NorthSeaFishOS
+
+using Random
+using Statistics
+using LinearAlgebra
+
+# ============================================================
+# RHINOBANK
+# NORTHSEA FISH BREEDING & AQUACULTURE RESEARCH PLATFORM
+#
+# Pure Julia
+#
+# Research domains:
+#
+#   • Fish population registry
+#   • Pedigree management
+#   • Genotype simulation
+#   • Phenotype simulation
+#   • Aquaculture trials
+#   • Genetic merit
+#   • Selection indices
+#   • Breeding candidates
+#   • Cross planning
+#   • Generation simulation
+#   • Feed efficiency
+#   • Growth
+#   • Robustness
+#   • Temperature tolerance
+#   • Disease-resilience proxy traits
+#   • Survival
+#   • Production economics
+#   • Portfolio analysis
+#
+# IMPORTANT:
+#
+# This system is a research/simulation platform.
+#
+# It does not prescribe biological release into wild North Sea
+# populations. Commercial deployment would require appropriate
+# animal-health, environmental, fisheries and aquaculture
+# approvals.
+# ============================================================
+
+
+# ============================================================
+# 1. SPECIES
+# ============================================================
+
+@enum FishSpecies begin
+    ATLANTIC_COD
+    ATLANTIC_SALMON
+    EUROPEAN_SEABASS
+    HADDOCK
+    HERRING
+    PLAICE
+    SOLE
+    TROUT
+end
+
+
+# ============================================================
+# 2. SEX
+# ============================================================
+
+@enum Sex begin
+    FEMALE
+    MALE
+    UNKNOWN
+end
+
+
+# ============================================================
+# 3. PRODUCTION ENVIRONMENT
+# ============================================================
+
+@enum Environment begin
+    LAND_BASED
+    RECIRCULATING_AQUACULTURE
+    COASTAL_FARM
+    OFFSHORE_FARM
+    RESEARCH_TANK
+end
+
+
+# ============================================================
+# 4. TRAIT SYSTEM
+# ============================================================
+
+"""
+Traits tracked by the breeding programme.
+
+Values are normalized for research simulation.
+"""
+
+struct TraitVector
+
+    growth::Float64
+
+    feed_efficiency::Float64
+
+    survival::Float64
+
+    disease_resilience::Float64
+
+    temperature_tolerance::Float64
+
+    oxygen_efficiency::Float64
+
+    flesh_quality::Float64
+
+    maturation::Float64
+
+end
+
+
+# ============================================================
+# 5. GENOTYPE
+# ============================================================
+
+struct Genotype
+
+    loci::Vector{Float64}
+
+end
+
+
+# ============================================================
+# 6. PEDIGREE
+# ============================================================
+
+struct Pedigree
+
+    fish_id::Int
+
+    parent1::Union{Nothing,Int}
+
+    parent2::Union{Nothing,Int}
+
+    generation::Int
+
+end
+
+
+# ============================================================
+# 7. FISH
+# ============================================================
+
+mutable struct Fish
+
+    id::Int
+
+    species::FishSpecies
+
+    strain::String
+
+    sex::Sex
+
+    genotype::Genotype
+
+    pedigree::Pedigree
+
+    generation::Int
+
+    birth_year::Int
+
+    alive::Bool
+
+end
+
+
+# ============================================================
+# 8. PHENOTYPE
+# ============================================================
+
+struct Phenotype
+
+    fish_id::Int
+
+    environment::Environment
+
+    age_months::Float64
+
+    weight_kg::Float64
+
+    length_cm::Float64
+
+    feed_conversion_ratio::Float64
+
+    survival_probability::Float64
+
+    disease_resilience::Float64
+
+    temperature_tolerance::Float64
+
+    oxygen_efficiency::Float64
+
+    flesh_quality::Float64
+
+end
+
+
+# ============================================================
+# 9. TRIAL
+# ============================================================
+
+mutable struct Trial
+
+    id::Int
+
+    name::String
+
+    species::FishSpecies
+
+    environment::Environment
+
+    year::Int
+
+    fish_ids::Vector{Int}
+
+    observations::Vector{Phenotype}
+
+end
+
+
+# ============================================================
+# 10. ECONOMIC MODEL
+# ============================================================
+
+struct ProductionEconomics
+
+    feed_cost_per_kg::Float64
+
+    energy_cost_per_kwh::Float64
+
+    labour_cost_per_fish::Float64
+
+    infrastructure_cost::Float64
+
+    fish_price_per_kg::Float64
+
+    mortality_cost_per_fish::Float64
+
+end
+
+
+# ============================================================
+# 11. BREEDING PROGRAMME
+# ============================================================
+
+mutable struct BreedingProgram
+
+    name::String
+
+    species::FishSpecies
+
+    fish::Dict{Int,Fish}
+
+    pedigrees::Dict{Int,Pedigree}
+
+    phenotypes::Vector{Phenotype}
+
+    trials::Dict{Int,Trial}
+
+    next_fish_id::Int
+
+    next_trial_id::Int
+
+end
+
+
+function BreedingProgram(
+    name::String,
+    species::FishSpecies
+)
+
+    BreedingProgram(
+
+        name,
+
+        species,
+
+        Dict{Int,Fish}(),
+
+        Dict{Int,Pedigree}(),
+
+        Phenotype[],
+
+        Dict{Int,Trial}(),
+
+        1,
+
+        1
+    )
+
+end
+
+
+# ============================================================
+# 12. RANDOM GENOTYPE
+# ============================================================
+
+function random_genotype(
+    loci::Int
+)
+
+    Genotype(
+        randn(loci)
+    )
+
+end
+
+
+# ============================================================
+# 13. REGISTER FISH
+# ============================================================
+
+function register_fish!(
+    program::BreedingProgram;
+
+    strain = "NORTHSEA",
+
+    sex = UNKNOWN,
+
+    genotype =
+        random_genotype(64),
+
+    parent1 = nothing,
+
+    parent2 = nothing,
+
+    generation = 0,
+
+    birth_year = 2026
+
+)
+
+    id =
+        program.next_fish_id
+
+
+    pedigree =
+        Pedigree(
+
+            id,
+
+            parent1,
+
+            parent2,
+
+            generation
+        )
+
+
+    fish =
+        Fish(
+
+            id,
+
+            program.species,
+
+            strain,
+
+            sex,
+
+            genotype,
+
+            pedigree,
+
+            generation,
+
+            birth_year,
+
+            true
+        )
+
+
+    program.fish[id] =
+        fish
+
+
+    program.pedigrees[id] =
+        pedigree
+
+
+    program.next_fish_id += 1
+
+
+    return id
+
+end
+
+
+# ============================================================
+# 14. GENETIC VALUE
+# ============================================================
+
+function genetic_value(
+    fish::Fish
+)
+
+    mean(
+        fish.genotype.loci
+    )
+
+end
+
+
+# ============================================================
+# 15. TRAIT EXPANSION
+# ============================================================
+
+function genetic_traits(
+    fish::Fish
+)
+
+    g =
+        genetic_value(fish)
+
+
+    TraitVector(
+
+        1.0 + 0.25*g,
+
+        1.0 - 0.08*g,
+
+        0.80 + 0.05*g,
+
+        0.75 + 0.07*g,
+
+        0.70 + 0.08*g,
+
+        0.75 + 0.05*g,
+
+        0.80 + 0.03*g,
+
+        1.0 + 0.04*g
+
+    )
+
+end
+
+
+# ============================================================
+# 16. ENVIRONMENT EFFECT
+# ============================================================
+
+function environment_effect(
+    environment::Environment
+)
+
+    environment == LAND_BASED &&
+        return 0.05
+
+    environment == RECIRCULATING_AQUACULTURE &&
+        return 0.10
+
+    environment == COASTAL_FARM &&
+        return 0.00
+
+    environment == OFFSHORE_FARM &&
+        return -0.10
+
+    environment == RESEARCH_TANK &&
+        return 0.15
+
+    return 0.0
+
+end
+
+
+# ============================================================
+# 17. PHENOTYPE SIMULATION
+# ============================================================
+
+function simulate_phenotype(
+    fish::Fish,
+    environment::Environment;
+
+    age_months = 18.0
+)
+
+    traits =
+        genetic_traits(fish)
+
+
+    env =
+        environment_effect(
+            environment
+        )
+
+
+    # ----------------------------------------
+    # Growth
+    # ----------------------------------------
+
+    weight =
+        max(
+
+            0.05,
+
+            3.0 *
+            traits.growth *
+            (1.0 + env) *
+            (1.0 + 0.08*randn())
+
+        )
+
+
+    length =
+        max(
+
+            5.0,
+
+            65.0 *
+            traits.growth *
+            (1.0 + 0.03*randn())
+
+        )
+
+
+    # ----------------------------------------
+    # Feed conversion
+    # Lower is better.
+    # ----------------------------------------
+
+    fcr =
+        clamp(
+
+            1.40 /
+            traits.feed_efficiency *
+            (1.0 + 0.05*randn()),
+
+            0.7,
+
+            4.0
+        )
+
+
+    # ----------------------------------------
+    # Survival
+    # ----------------------------------------
+
+    survival =
+        clamp(
+
+            traits.survival *
+            (1.0 + env),
+
+            0.0,
+
+            1.0
+        )
+
+
+    # ----------------------------------------
+    # Other traits
+    # ----------------------------------------
+
+    disease =
+        clamp(
+
+            traits.disease_resilience *
+            100.0 +
+            5.0*randn(),
+
+            0.0,
+
+            100.0
+        )
+
+
+    temperature =
+        clamp(
+
+            traits.temperature_tolerance *
+            100.0 +
+            5.0*randn(),
+
+            0.0,
+
+            100.0
+        )
+
+
+    oxygen =
+        clamp(
+
+            traits.oxygen_efficiency *
+            100.0 +
+            5.0*randn(),
+
+            0.0,
+
+            100.0
+        )
+
+
+    flesh =
+        clamp(
+
+            traits.flesh_quality *
+            80.0 +
+            5.0*randn(),
+
+            0.0,
+
+            100.0
+        )
+
+
+    Phenotype(
+
+        fish.id,
+
+        environment,
+
+        age_months,
+
+        weight,
+
+        length,
+
+        fcr,
+
+        survival,
+
+        disease,
+
+        temperature,
+
+        oxygen,
+
+        flesh
+    )
+
+end
+
+
+# ============================================================
+# 18. CREATE TRIAL
+# ============================================================
+
+function create_trial!(
+    program::BreedingProgram,
+
+    name::String,
+
+    environment::Environment,
+
+    fish_ids::Vector{Int};
+
+    year = 2026,
+
+    age_months = 18.0
+
+)
+
+    id =
+        program.next_trial_id
+
+
+    observations =
+        Phenotype[]
+
+
+    for fish_id in fish_ids
+
+        fish =
+            program.fish[fish_id]
+
+
+        phenotype =
+            simulate_phenotype(
+
+                fish,
+
+                environment;
+
+                age_months
+            )
+
+
+        push!(
+            observations,
+            phenotype
+        )
+
+
+        push!(
+            program.phenotypes,
+            phenotype
+        )
+
+    end
+
+
+    trial =
+        Trial(
+
+            id,
+
+            name,
+
+            program.species,
+
+            environment,
+
+            year,
+
+            fish_ids,
+
+            observations
+        )
+
+
+    program.trials[id] =
+        trial
+
+
+    program.next_trial_id += 1
+
+
+    return id
+
+end
+
+
+# ============================================================
+# 19. PHENOTYPE LOOKUP
+# ============================================================
+
+function phenotypes_for_fish(
+    program::BreedingProgram,
+    fish_id::Int
+)
+
+    filter(
+
+        x -> x.fish_id == fish_id,
+
+        program.phenotypes
+
+    )
+
+end
+
+
+# ============================================================
+# 20. BREEDING VALUE
+# ============================================================
+
+function breeding_value(
+    program::BreedingProgram,
+    fish_id::Int
+)
+
+    observations =
+        phenotypes_for_fish(
+            program,
+            fish_id
+        )
+
+
+    isempty(observations) &&
+        return NaN
+
+
+    scores =
+        Float64[]
+
+
+    for p in observations
+
+        score =
+
+            1.0 *
+            p.weight_kg +
+
+            2.0 *
+            p.survival_probability +
+
+            0.05 *
+            p.disease_resilience +
+
+            0.05 *
+            p.temperature_tolerance +
+
+            0.05 *
+            p.oxygen_efficiency +
+
+            0.03 *
+            p.flesh_quality +
+
+            1.0 /
+            p.feed_conversion_ratio
+
+
+        push!(
+            scores,
+            score
+        )
+
+    end
+
+
+    mean(scores)
+
+end
+
+
+# ============================================================
+# 21. RHINOBANK SELECTION INDEX
+# ============================================================
+
+struct SelectionIndex
+
+    growth_weight::Float64
+
+    feed_weight::Float64
+
+    survival_weight::Float64
+
+    disease_weight::Float64
+
+    temperature_weight::Float64
+
+    oxygen_weight::Float64
+
+    flesh_weight::Float64
+
+end
+
+
+function selection_score(
+    p::Phenotype,
+    index::SelectionIndex
+)
+
+    index.growth_weight *
+        p.weight_kg +
+
+    index.feed_weight *
+        (1.0 / p.feed_conversion_ratio) +
+
+    index.survival_weight *
+        p.survival_probability +
+
+    index.disease_weight *
+        p.disease_resilience +
+
+    index.temperature_weight *
+        p.temperature_tolerance +
+
+    index.oxygen_weight *
+        p.oxygen_efficiency +
+
+    index.flesh_weight *
+        p.flesh_quality
+
+end
+
+
+# ============================================================
+# 22. RANK FISH
+# ============================================================
+
+function rank_fish(
+    program::BreedingProgram,
+
+    index::SelectionIndex
+)
+
+    scores =
+        Dict{Int,Float64}()
+
+
+    for fish in values(
+        program.fish
+    )
+
+        observations =
+            phenotypes_for_fish(
+                program,
+                fish.id
+            )
+
+
+        isempty(observations) &&
+            continue
+
+
+        score =
+            mean(
+
+                selection_score(
+                    p,
+                    index
+                )
+
+                for p in observations
+            )
+
+
+        scores[
+            fish.id
+        ] =
+            score
+
+    end
+
+
+    sort(
+
+        collect(scores),
+
+        by = x -> x[2],
+
+        rev = true
+    )
+
+end
+
+
+# ============================================================
+# 23. ELITE SELECTION
+# ============================================================
+
+function select_breeders(
+    program::BreedingProgram,
+
+    number::Int,
+
+    index::SelectionIndex
+)
+
+    ranking =
+        rank_fish(
+            program,
+            index
+        )
+
+
+    n =
+        min(
+            number,
+            length(ranking)
+        )
+
+
+    [
+        ranking[i][1]
+        for i in 1:n
+    ]
+
+end
+
+
+# ============================================================
+# 24. GENETIC CROSS
+# ============================================================
+
+"""
+Simulated inheritance.
+
+This is deliberately a computational population-genetics
+model rather than a laboratory breeding protocol.
+"""
+
+function cross!(
+    program::BreedingProgram,
+
+    parent1_id::Int,
+
+    parent2_id::Int;
+
+    generation::Int,
+
+    strain::String
+
+)
+
+    p1 =
+        program.fish[parent1_id]
+
+
+    p2 =
+        program.fish[parent2_id]
+
+
+    loci =
+        min(
+
+            length(
+                p1.genotype.loci
+            ),
+
+            length(
+                p2.genotype.loci
+            )
+
+        )
+
+
+    child =
+        Vector{Float64}(
+            undef,
+            loci
+        )
+
+
+    for i in 1:loci
+
+        parent_value =
+
+            rand() < 0.5 ?
+
+            p1.genotype.loci[i] :
+
+            p2.genotype.loci[i]
+
+
+        child[i] =
+
+            parent_value +
+
+            0.01 *
+            randn()
+
+    end
+
+
+    sex =
+
+        rand() < 0.5 ?
+
+        FEMALE :
+
+        MALE
+
+
+    register_fish!(
+
+        program;
+
+        strain,
+
+        sex,
+
+        genotype =
+            Genotype(child),
+
+        parent1 =
+            parent1_id,
+
+        parent2 =
+            parent2_id,
+
+        generation,
+
+        birth_year =
+            2026
+
+    )
+
+end
+
+
+# ============================================================
+# 25. CROSS PLAN
+# ============================================================
+
+struct CrossPlan
+
+    parent1::Int
+
+    parent2::Int
+
+end
+
+
+function crossing_plan(
+    breeders::Vector{Int}
+)
+
+    plans =
+        CrossPlan[]
+
+
+    for i in 1:length(breeders)
+
+        for j in i+1:length(breeders)
+
+            push!(
+
+                plans,
+
+                CrossPlan(
+
+                    breeders[i],
+
+                    breeders[j]
+
+                )
+
+            )
+
+        end
+
+    end
+
+
+    plans
+
+end
+
+
+# ============================================================
+# 26. GENERATION ENGINE
+# ============================================================
+
+function generate_generation!(
+    program::BreedingProgram,
+
+    plans::Vector{CrossPlan},
+
+    offspring_per_cross::Int,
+
+    generation::Int
+
+)
+
+    offspring =
+        Int[]
+
+
+    for plan in plans
+
+        for n in 1:offspring_per_cross
+
+            id =
+                cross!(
+
+                    program,
+
+                    plan.parent1,
+
+                    plan.parent2;
+
+                    generation,
+
+                    strain =
+                        "RHINO-G$(generation)"
+                )
+
+
+            push!(
+                offspring,
+                id
+            )
+
+        end
+
+    end
+
+
+    offspring
+
+end
+
+
+# ============================================================
+# 27. PRODUCTION ECONOMICS
+# ============================================================
+
+function production_value(
+    phenotype::Phenotype,
+
+    economics::ProductionEconomics
+)
+
+    revenue =
+
+        phenotype.weight_kg *
+        phenotype.survival_probability *
+        economics.fish_price_per_kg
+
+
+    feed_cost =
+
+        phenotype.weight_kg *
+        phenotype.feed_conversion_ratio *
+        economics.feed_cost_per_kg
+
+
+    energy_cost =
+
+        phenotype.weight_kg *
+        economics.energy_cost_per_kwh
+
+
+    labour =
+
+        economics.labour_cost_per_fish
+
+
+    mortality =
+
+        (1.0 -
+         phenotype.survival_probability) *
+
+        economics.mortality_cost_per_fish
+
+
+    revenue -
+    feed_cost -
+    energy_cost -
+    labour -
+    mortality
+
+end
+
+
+# ============================================================
+# 28. PORTFOLIO VALUE
+# ============================================================
+
+function programme_value(
+    program::BreedingProgram,
+
+    economics::ProductionEconomics
+)
+
+    values =
+        Float64[]
+
+
+    for phenotype in
+        program.phenotypes
+
+        push!(
+
+            values,
+
+            production_value(
+                phenotype,
+                economics
+            )
+
+        )
+
+    end
+
+
+    isempty(values) &&
+        return 0.0
+
+
+    sum(values)
+
+end
+
+
+# ============================================================
+# 29. DIVERSITY METRIC
+# ============================================================
+
+"""
+Simple genetic-diversity proxy.
+
+A production implementation would use actual marker data and
+population-genetic statistics.
+"""
+
+function genetic_diversity(
+    program::BreedingProgram
+)
+
+    isempty(
+        program.fish
+    ) &&
+        return 0.0
+
+
+    vectors = [
+
+        fish.genotype.loci
+
+        for fish in
+        values(program.fish)
+
+    ]
+
+
+    matrix =
+        reduce(
+            hcat,
+            vectors
+        )
+
+
+    mean(
+        std(
+            matrix,
+            dims = 2
+        )
+    )
+
+end
+
+
+# ============================================================
+# 30. CONCENTRATION WARNING
+# ============================================================
+
+function diversity_warning(
+    program::BreedingProgram,
+
+    threshold::Float64 = 0.20
+)
+
+    diversity =
+        genetic_diversity(
+            program
+        )
+
+
+    if diversity < threshold
+
+        return :LOW_DIVERSITY
+
+    end
+
+
+    return :DIVERSITY_OK
+
+end
+
+
+# ============================================================
+# 31. PROGRAMME DASHBOARD
+# ============================================================
+
+function dashboard(
+    program::BreedingProgram
+)
+
+    println()
+    println(
+        "================================================"
+    )
+
+    println(
+        " RHINOBANK NORTHSEAFISH.OS"
+    )
+
+    println(
+        "================================================"
+    )
+
+    println(
+        "Programme : ",
+        program.name
+    )
+
+    println(
+        "Species   : ",
+        program.species
+    )
+
+    println(
+        "Fish      : ",
+        length(program.fish)
+    )
+
+    println(
+        "Trials    : ",
+        length(program.trials)
+    )
+
+    println(
+        "Observations : ",
+        length(program.phenotypes)
+    )
+
+    println(
+        "Genetic diversity proxy : ",
+
+        round(
+
+            genetic_diversity(
+                program
+            ),
+
+            digits = 4
+        )
+    )
+
+    println(
+        "Diversity status : ",
+
+        diversity_warning(
+            program
+        )
+    )
+
+    println(
+        "================================================"
+    )
+
+end
+
+
+# ============================================================
+# 32. RESEARCH REPORT
+# ============================================================
+
+function research_report(
+    program::BreedingProgram,
+
+    index::SelectionIndex
+)
+
+    ranking =
+        rank_fish(
+            program,
+            index
+        )
+
+
+    println()
+    println(
+        "RHINOBANK BREEDING REPORT"
+    )
+
+    println(
+        "-------------------------"
+    )
+
+
+    for (rank, entry)
+        in enumerate(ranking)
+
+        fish_id =
+            entry[1]
+
+        score =
+            entry[2]
+
+
+        fish =
+            program.fish[
+                fish_id
+            ]
+
+
+        println(
+
+            lpad(
+                rank,
+                3
+            ),
+
+            " | FISH ",
+
+            fish_id,
+
+            " | ",
+
+            fish.strain,
+
+            " | G",
+
+            fish.generation,
+
+            " | SCORE ",
+
+            round(
+                score,
+                digits = 3
+            )
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# 33. DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    Random.seed!(
+
+        20260830
+    )
+
+
+    # --------------------------------------------------------
+    # RhinoBank programme
+    # --------------------------------------------------------
+
+    program =
+
+        BreedingProgram(
+
+            "RhinoBank North Sea
+             Aquaculture Research Programme",
+
+            ATLANTIC_COD
+        )
+
+
+    # --------------------------------------------------------
+    # Founder population
+    # --------------------------------------------------------
+
+    founders =
+        Int[]
+
+
+    for i in 1:40
+
+        id =
+
+            register_fish!(
+
+                program;
+
+                strain =
+                    "NORTHSEA-FOUND",
+
+                sex =
+                    rand(
+                        (FEMALE, MALE)
+                    ),
+
+                genotype =
+                    random_genotype(64),
+
+                generation = 0,
+
+                birth_year = 2026
+            )
+
+
+        push!(
+            founders,
+            id
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # Research environments
+    # --------------------------------------------------------
+
+    create_trial!(
+
+        program,
+
+        "NORTHSEA-RAS",
+
+        RECIRCULATING_AQUACULTURE,
+
+        founders;
+
+        year = 2026,
+
+        age_months = 18
+    )
+
+
+    create_trial!(
+
+        program,
+
+        "NORTHSEA-OFFSHORE",
+
+        OFFSHORE_FARM,
+
+        founders;
+
+        year = 2026,
+
+        age_months = 18
+    )
+
+
+    # --------------------------------------------------------
+    # RhinoBank investment selection index
+    # --------------------------------------------------------
+
+    index =
+
+        SelectionIndex(
+
+            2.0,   # growth
+
+            2.5,   # feed efficiency
+
+            3.0,   # survival
+
+            2.5,   # resilience
+
+            1.5,   # temperature
+
+            1.5,   # oxygen
+
+            1.0    # flesh quality
+        )
+
+
+    # --------------------------------------------------------
+    # Select elite candidates
+    # --------------------------------------------------------
+
+    breeders =
+
+        select_breeders(
+
+            program,
+
+            10,
+
+            index
+        )
+
+
+    println()
+
+    println(
+        "ELITE BREEDERS"
+    )
+
+    println(
+        "--------------"
+    )
+
+
+    for id in breeders
+
+        println(
+
+            "Fish ",
+
+            id,
+
+            " | BV = ",
+
+            round(
+
+                breeding_value(
+                    program,
+                    id
+                ),
+
+                digits = 3
+            )
+
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # Crossing plan
+    # --------------------------------------------------------
+
+    plans =
+
+        crossing_plan(
+            breeders
+        )
+
+
+    println()
+
+    println(
+
+        "CROSSING PLANS: ",
+
+        length(plans)
+    )
+
+
+    # --------------------------------------------------------
+    # Generate G1
+    # --------------------------------------------------------
+
+    g1 =
+
+        generate_generation!(
+
+            program,
+
+            plans,
+
+            4,
+
+            1
+        )
+
+
+    println(
+
+        "G1 OFFSPRING: ",
+
+        length(g1)
+    )
+
+
+    # --------------------------------------------------------
+    # G1 trials
+    # --------------------------------------------------------
+
+    create_trial!(
+
+        program,
+
+        "G1-OFFSHORE",
+
+        OFFSHORE_FARM,
+
+        g1;
+
+        year = 2030,
+
+        age_months = 18
+    )
+
+
+    create_trial!(
+
+        program,
+
+        "G1-RAS",
+
+        RECIRCULATING_AQUACULTURE,
+
+        g1;
+
+        year = 2030,
+
+        age_months = 18
+    )
+
+
+    # --------------------------------------------------------
+    # Economics
+    # --------------------------------------------------------
+
+    economics =
+
+        ProductionEconomics(
+
+            1.20,     # feed €/kg
+
+            0.20,     # energy €/kWh
+
+            4.00,     # labour/fish
+
+            2_000_000.0,
+
+            8.50,     # fish €/kg
+
+            12.00
+        )
+
+
+    value =
+
+        programme_value(
+
+            program,
+
+            economics
+        )
+
+
+    println()
+
+    println(
+
+        "SIMULATED PROGRAMME VALUE: €",
+
+        round(
+            value,
+            digits = 2
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # Dashboard
+    # --------------------------------------------------------
+
+    dashboard(
+        program
+    )
+
+
+    # --------------------------------------------------------
+    # Research ranking
+    # --------------------------------------------------------
+
+    research_report(
+
+        program,
+
+        index
+    )
+
+
+    return program
+
+end
+
+
+end # module
+
+
+# ============================================================
+# START RHINOBANK NORTHSEAFISH.OS
+# ============================================================
+
+using .NorthSeaFishOS
+
+program =
+    NorthSeaFishOS.demo()
