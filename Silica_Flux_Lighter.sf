@@ -1,0 +1,1070 @@
+module SilicaFluxHydrogenLighter
+
+# ============================================================
+# SILICAFLUX / H2-LIGHTER.OS
+#
+# Unified machine-readable reference model
+#
+# Layers represented:
+#
+#   DEVICE CONTRACT
+#        ↓
+#   SAFETY ENGINE
+#        ↓
+#   STATE MACHINE
+#        ↓
+#   BURN PROFILE
+#        ↓
+#   TELEMETRY
+#
+# This is a reference/simulation model.
+# It deliberately does NOT provide physical GPIO, valve,
+# igniter, PWM, or hydrogen-delivery drivers.
+#
+# Any safety failure forces the simulated outputs OFF.
+# ============================================================
+
+
+# ============================================================
+# VERSION
+# ============================================================
+
+const SOFTWARE_NAME = "H2-LIGHTER.OS"
+const VERSION       = v"1.0.0"
+
+
+# ============================================================
+# DEVICE STATES
+# ============================================================
+
+@enum State begin
+    OFF
+    READY
+    IGNITING
+    BURNING
+    COOLING
+    FAULT
+end
+
+
+# ============================================================
+# BURN SELECTOR
+# ============================================================
+
+@enum BurnAmount begin
+    SHORT
+    MEDIUM
+    LONG
+end
+
+
+struct BurnProfile
+
+    amount::BurnAmount
+
+    duration_ms::UInt32
+
+end
+
+
+# Bounded software profiles.
+#
+# These represent abstract burn-duration selections rather
+# than a physical hydrogen-flow specification.
+
+const BURN_PROFILES = (
+
+    BurnProfile(
+        SHORT,
+        UInt32(500)
+    ),
+
+    BurnProfile(
+        MEDIUM,
+        UInt32(1000)
+    ),
+
+    BurnProfile(
+        LONG,
+        UInt32(2000)
+    )
+
+)
+
+
+function get_profile(
+    amount::BurnAmount
+)::BurnProfile
+
+    for profile in BURN_PROFILES
+
+        if profile.amount == amount
+            return profile
+        end
+
+    end
+
+    error("Invalid burn profile")
+
+end
+
+
+# ============================================================
+# SENSOR SNAPSHOT
+# ============================================================
+
+Base.@kwdef mutable struct Sensors
+
+    battery_ok::Bool = false
+
+    safety_closed::Bool = false
+
+    gas_detected::Bool = false
+
+    temperature_ok::Bool = false
+
+    pressure_ok::Bool = false
+
+    flame_detected::Bool = false
+
+end
+
+
+# ============================================================
+# USER COMMANDS
+# ============================================================
+
+Base.@kwdef struct Commands
+
+    ignition_request::Bool = false
+
+    stop_request::Bool = false
+
+    emergency_stop::Bool = false
+
+end
+
+
+# ============================================================
+# OUTPUT MODEL
+# ============================================================
+
+Base.@kwdef mutable struct Outputs
+
+    status::State = OFF
+
+    hydrogen_enable::Bool = false
+
+    ignition_enable::Bool = false
+
+end
+
+
+function safe_outputs!(
+    outputs::Outputs
+)
+
+    outputs.hydrogen_enable = false
+    outputs.ignition_enable = false
+
+end
+
+
+# ============================================================
+# SAFETY RESULT
+# ============================================================
+
+@enum SafetyStatus begin
+    SAFE
+    LOCKED
+    UNSAFE
+end
+
+
+struct SafetyResult
+
+    status::SafetyStatus
+
+    battery_ok::Bool
+
+    safety_closed::Bool
+
+    gas_clear::Bool
+
+    temperature_ok::Bool
+
+    pressure_ok::Bool
+
+end
+
+
+# ============================================================
+# SAFETY ENGINE
+# ============================================================
+
+function evaluate_safety(
+    sensors::Sensors
+)::SafetyResult
+
+    gas_clear =
+        !sensors.gas_detected
+
+
+    safe =
+        sensors.battery_ok &&
+        sensors.safety_closed &&
+        gas_clear &&
+        sensors.temperature_ok &&
+        sensors.pressure_ok
+
+
+    locked =
+        sensors.battery_ok &&
+        sensors.safety_closed &&
+        gas_clear &&
+        !sensors.temperature_ok
+
+
+    if safe
+
+        result = SAFE
+
+    elseif sensors.gas_detected ||
+           !sensors.temperature_ok ||
+           !sensors.pressure_ok
+
+        result = UNSAFE
+
+    else
+
+        result = LOCKED
+
+    end
+
+
+    SafetyResult(
+
+        result,
+
+        sensors.battery_ok,
+
+        sensors.safety_closed,
+
+        gas_clear,
+
+        sensors.temperature_ok,
+
+        sensors.pressure_ok
+
+    )
+
+end
+
+
+# ============================================================
+# CONTROLLER
+# ============================================================
+
+mutable struct Controller
+
+    state::State
+
+    sensors::Sensors
+
+    commands::Commands
+
+    outputs::Outputs
+
+    burn_profile::BurnProfile
+
+    elapsed_ms::UInt32
+
+    ignition_elapsed_ms::UInt32
+
+end
+
+
+# ============================================================
+# LIMITS
+# ============================================================
+
+const MAX_IGNITION_TIME_MS =
+    UInt32(5000)
+
+
+const MAX_BURN_TIME_MS =
+    UInt32(5000)
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function Controller()
+
+    Controller(
+
+        OFF,
+
+        Sensors(),
+
+        Commands(),
+
+        Outputs(),
+
+        get_profile(SHORT),
+
+        UInt32(0),
+
+        UInt32(0)
+
+    )
+
+end
+
+
+# ============================================================
+# SAFETY TRANSITION
+# ============================================================
+
+function enter_fault!(
+    controller::Controller
+)
+
+    controller.state = FAULT
+
+    controller.outputs.status = FAULT
+
+    safe_outputs!(
+        controller.outputs
+    )
+
+end
+
+
+# ============================================================
+# LOCK
+# ============================================================
+
+function enter_locked!(
+    controller::Controller
+)
+
+    controller.state = OFF
+
+    controller.outputs.status = OFF
+
+    safe_outputs!(
+        controller.outputs
+    )
+
+end
+
+
+# ============================================================
+# SELECT BURN AMOUNT
+# ============================================================
+
+function select_burn!(
+    controller::Controller,
+    amount::BurnAmount
+)
+
+    # Burn profile can be selected only while idle.
+
+    if controller.state != OFF &&
+       controller.state != READY
+
+        return false
+
+    end
+
+
+    controller.burn_profile =
+        get_profile(amount)
+
+
+    true
+
+end
+
+
+# ============================================================
+# ARM
+# ============================================================
+
+function arm!(
+    controller::Controller
+)
+
+    safety =
+        evaluate_safety(
+            controller.sensors
+        )
+
+
+    if safety.status == SAFE
+
+        controller.state = READY
+
+        controller.outputs.status =
+            READY
+
+        safe_outputs!(
+            controller.outputs
+        )
+
+        return true
+
+    end
+
+
+    if safety.status == UNSAFE
+
+        enter_fault!(
+            controller
+
+        )
+
+    else
+
+        enter_locked!(
+            controller
+
+        )
+
+    end
+
+
+    false
+
+end
+
+
+# ============================================================
+# START REQUEST
+# ============================================================
+
+function request_ignition!(
+    controller::Controller
+)
+
+    if controller.state != READY
+        return false
+    end
+
+
+    safety =
+        evaluate_safety(
+            controller.sensors
+        )
+
+
+    if safety.status != SAFE
+
+        enter_fault!(
+            controller
+        )
+
+        return false
+
+    end
+
+
+    controller.elapsed_ms =
+        UInt32(0)
+
+
+    controller.ignition_elapsed_ms =
+        UInt32(0)
+
+
+    controller.state =
+        IGNITING
+
+
+    controller.outputs.status =
+        IGNITING
+
+
+    # IMPORTANT:
+    # This reference model does not command a physical
+    # hydrogen valve or igniter.
+
+    controller.outputs.hydrogen_enable =
+        false
+
+    controller.outputs.ignition_enable =
+        false
+
+
+    true
+
+end
+
+
+# ============================================================
+# STOP
+# ============================================================
+
+function stop!(
+    controller::Controller
+)
+
+    safe_outputs!(
+        controller.outputs
+    )
+
+
+    controller.state =
+        COOLING
+
+
+    controller.outputs.status =
+        COOLING
+
+
+    controller.elapsed_ms =
+        UInt32(0)
+
+end
+
+
+# ============================================================
+# FLAME VALIDATION
+# ============================================================
+
+function flame_valid(
+    controller::Controller
+)
+
+    s = controller.sensors
+
+
+    s.flame_detected &&
+    s.safety_closed &&
+    !s.gas_detected &&
+    s.temperature_ok &&
+    s.pressure_ok
+
+end
+
+
+# ============================================================
+# MAIN STATE MACHINE
+# ============================================================
+
+function update!(
+    controller::Controller,
+    dt_ms::Integer
+)
+
+    dt =
+        UInt32(
+            max(dt_ms, 0)
+        )
+
+
+    # --------------------------------------------------------
+    # EMERGENCY STOP
+    # --------------------------------------------------------
+
+    if controller.commands.emergency_stop
+
+        enter_fault!(
+            controller
+        )
+
+        return controller.state
+
+    end
+
+
+    # --------------------------------------------------------
+    # GLOBAL SAFETY
+    # --------------------------------------------------------
+
+    safety =
+        evaluate_safety(
+            controller.sensors
+        )
+
+
+    if safety.status == UNSAFE
+
+        enter_fault!(
+            controller
+
+        )
+
+        return controller.state
+
+    end
+
+
+    # --------------------------------------------------------
+    # STOP REQUEST
+    # --------------------------------------------------------
+
+    if controller.commands.stop_request
+
+        stop!(
+            controller
+
+        )
+
+        return controller.state
+
+    end
+
+
+    # --------------------------------------------------------
+    # STATE MACHINE
+    # --------------------------------------------------------
+
+    if controller.state == OFF
+
+        safe_outputs!(
+            controller.outputs
+        )
+
+
+        if safety.status == SAFE
+
+            controller.state =
+                READY
+
+            controller.outputs.status =
+                READY
+
+        end
+
+
+    elseif controller.state == READY
+
+        safe_outputs!(
+            controller.outputs
+        )
+
+
+        controller.outputs.status =
+            READY
+
+
+        if controller.commands.ignition_request
+
+            request_ignition!(
+                controller
+            )
+
+        end
+
+
+    elseif controller.state == IGNITING
+
+        controller.ignition_elapsed_ms =
+            controller.ignition_elapsed_ms +
+            dt
+
+
+        # Flame detected.
+
+        if flame_valid(controller)
+
+            controller.state =
+                BURNING
+
+            controller.outputs.status =
+                BURNING
+
+            controller.elapsed_ms =
+                UInt32(0)
+
+            return controller.state
+
+        end
+
+
+        # Ignition timeout.
+
+        if controller.ignition_elapsed_ms >=
+           MAX_IGNITION_TIME_MS
+
+            enter_fault!(
+                controller
+
+            )
+
+            return controller.state
+
+        end
+
+
+    elseif controller.state == BURNING
+
+        controller.elapsed_ms =
+            controller.elapsed_ms +
+            dt
+
+
+        # Loss of flame.
+
+        if !flame_valid(controller)
+
+            enter_fault!(
+                controller
+
+            )
+
+            return controller.state
+
+        end
+
+
+        # Selected burn duration.
+
+        if controller.elapsed_ms >=
+           controller.burn_profile.duration_ms
+
+            stop!(
+                controller
+
+            )
+
+            return controller.state
+
+        end
+
+
+        # Absolute maximum runtime.
+
+        if controller.elapsed_ms >=
+           MAX_BURN_TIME_MS
+
+            stop!(
+                controller
+
+            )
+
+            return controller.state
+
+        end
+
+
+    elseif controller.state == COOLING
+
+        safe_outputs!(
+            controller.outputs
+        )
+
+
+        controller.outputs.status =
+            COOLING
+
+
+        # In a real implementation this would use a
+        # calibrated cooldown sensor rather than merely
+        # the boolean temperature_ok signal.
+
+        if controller.sensors.temperature_ok
+
+            controller.state =
+                READY
+
+            controller.outputs.status =
+                READY
+
+        end
+
+
+    elseif controller.state == FAULT
+
+        # Latched safe state.
+
+        safe_outputs!(
+            controller.outputs
+        )
+
+
+        controller.outputs.status =
+            FAULT
+
+    end
+
+
+    controller.state
+
+end
+
+
+# ============================================================
+# COMMAND MANAGEMENT
+# ============================================================
+
+function clear_commands!(
+    controller::Controller
+)
+
+    controller.commands =
+        Commands()
+
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function status(
+    controller::Controller
+)
+
+    safety =
+        evaluate_safety(
+            controller.sensors
+        )
+
+
+    println()
+    println("========================================")
+    println("        ", SOFTWARE_NAME)
+    println("        VERSION ", VERSION)
+    println("========================================")
+
+    println("STATE       : ", controller.state)
+
+    println(
+        "SAFETY      : ",
+        safety.status
+    )
+
+    println(
+        "BURN        : ",
+        controller.burn_profile.amount
+    )
+
+    println(
+        "DURATION    : ",
+        controller.burn_profile.duration_ms,
+        " ms"
+    )
+
+    println(
+        "HYDROGEN    : ",
+        controller.outputs.hydrogen_enable
+    )
+
+    println(
+        "IGNITION    : ",
+        controller.outputs.ignition_enable
+    )
+
+    println(
+        "FLAME       : ",
+        controller.sensors.flame_detected
+    )
+
+    println(
+        "GAS         : ",
+        controller.sensors.gas_detected
+    )
+
+    println("========================================")
+
+end
+
+
+# ============================================================
+# MACHINE-READABLE SNAPSHOT
+# ============================================================
+
+struct DeviceSnapshot
+
+    version::VersionNumber
+
+    state::State
+
+    burn_amount::BurnAmount
+
+    burn_duration_ms::UInt32
+
+    battery_ok::Bool
+
+    safety_closed::Bool
+
+    gas_detected::Bool
+
+    temperature_ok::Bool
+
+    pressure_ok::Bool
+
+    flame_detected::Bool
+
+    hydrogen_enable::Bool
+
+    ignition_enable::Bool
+
+end
+
+
+function snapshot(
+    controller::Controller
+)
+
+    DeviceSnapshot(
+
+        VERSION,
+
+        controller.state,
+
+        controller.burn_profile.amount,
+
+        controller.burn_profile.duration_ms,
+
+        controller.sensors.battery_ok,
+
+        controller.sensors.safety_closed,
+
+        controller.sensors.gas_detected,
+
+        controller.sensors.temperature_ok,
+
+        controller.sensors.pressure_ok,
+
+        controller.sensors.flame_detected,
+
+        controller.outputs.hydrogen_enable,
+
+        controller.outputs.ignition_enable
+
+    )
+
+end
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+function self_test()
+
+    controller =
+        Controller()
+
+
+    # Safe simulated sensor state.
+
+    controller.sensors =
+        Sensors(
+
+            battery_ok = true,
+
+            safety_closed = true,
+
+            gas_detected = false,
+
+            temperature_ok = true,
+
+            pressure_ok = true,
+
+            flame_detected = false
+
+        )
+
+
+    @assert arm!(
+        controller
+    )
+
+
+    @assert controller.state ==
+        READY
+
+
+    @assert select_burn!(
+        controller,
+        MEDIUM
+    )
+
+
+    @assert controller.burn_profile.amount ==
+        MEDIUM
+
+
+    # Simulated ignition request.
+
+    controller.commands =
+        Commands(
+            ignition_request = true
+        )
+
+
+    update!(
+        controller,
+        1
+    )
+
+
+    @assert controller.state ==
+        IGNITING
+
+
+    clear_commands!(
+        controller
+    )
+
+
+    # Simulated flame confirmation.
+
+    controller.sensors.flame_detected =
+        true
+
+
+    update!(
+        controller,
+        1
+    )
+
+
+    @assert controller.state ==
+        BURNING
+
+
+    # Gas detection must always cause FAULT.
+
+    controller.sensors.gas_detected =
+        true
+
+
+    update!(
+        controller,
+        1
+    )
+
+
+    @assert controller.state ==
+        FAULT
+
+
+    @assert !controller.outputs.hydrogen_enable
+
+    @assert !controller.outputs.ignition_enable
+
+
+    println(
+        "H2-LIGHTER.OS SELF TEST: PASS"
+    )
+
+end
+
+
+end # module
+
+
+# ============================================================
+# EXECUTE SELF TEST
+# ============================================================
+
+using .SilicaFluxHydrogenLighter
+
+SilicaFluxHydrogenLighter.self_test()
