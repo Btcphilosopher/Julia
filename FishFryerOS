@@ -1,0 +1,1723 @@
+module FishFryerOS
+
+using Dates
+
+# ============================================================
+# FISHFRYER.OS
+#
+# Production-Grade Commercial Fish & Chip Fryer Controller
+#
+# Pure Julia
+#
+# PURPOSE
+# -------
+# Supervisory control software for a commercial fryer capable
+# of continuous fish-and-chip production.
+#
+# CORE SYSTEMS
+# ------------
+#   1. Fryer state machine
+#   2. Recipe engine
+#   3. Multi-vat management
+#   4. Thermal control
+#   5. Basket sequencing
+#   6. Oil monitoring
+#   7. Production tracking
+#   8. HACCP-oriented records
+#   9. Alarm management
+#  10. Diagnostics
+#  11. Cleaning/service modes
+#
+# IMPORTANT
+# ---------
+# This software is NOT the sole safety mechanism.
+#
+# Commercial hardware must independently implement:
+#
+#   - emergency stop
+#   - independent over-temperature protection
+#   - burner/heater safety
+#   - flame supervision where applicable
+#   - pressure protection
+#   - oil-level protection
+#   - electrical isolation
+#   - mechanical guarding
+#   - safety-rated interlocks
+#
+# ============================================================
+
+
+# ============================================================
+# ENUMERATIONS
+# ============================================================
+
+@enum FryerState begin
+    POWER_OFF
+    INITIALISING
+    PREHEATING
+    READY
+    LOADING
+    COOKING
+    DRAINING
+    HOLDING
+    CLEANING
+    SERVICE
+    SHUTDOWN
+    FAULT
+end
+
+
+@enum CookStage begin
+    NO_STAGE
+    FIRST_FRY
+    SECOND_FRY
+    FISH_FRY
+end
+
+
+@enum BasketState begin
+    BASKET_UNKNOWN
+    BASKET_UP
+    BASKET_DOWN
+    BASKET_MOVING
+end
+
+
+@enum AlarmSeverity begin
+    INFO
+    WARNING
+    CRITICAL
+end
+
+
+# ============================================================
+# PRODUCT RECIPE
+# ============================================================
+
+struct FryRecipe
+
+    name::Symbol
+
+    product::Symbol
+
+    stage::CookStage
+
+    target_temperature_c::Float64
+
+    cook_time_s::Float64
+
+    drain_time_s::Float64
+
+    maximum_batch_mass_kg::Float64
+
+    minimum_temperature_c::Float64
+
+end
+
+
+# ============================================================
+# DEFAULT RECIPES
+# ============================================================
+
+const CHIPS_STANDARD = FryRecipe(
+
+    :CHIPS_STANDARD,
+
+    :CHIPS,
+
+    FIRST_FRY,
+
+    150.0,
+
+    240.0,
+
+    15.0,
+
+    8.0,
+
+    140.0
+)
+
+
+const CHIPS_FINISH = FryRecipe(
+
+    :CHIPS_FINISH,
+
+    :CHIPS,
+
+    SECOND_FRY,
+
+    180.0,
+
+    150.0,
+
+    15.0,
+
+    8.0,
+
+    170.0
+)
+
+
+const FISH_STANDARD = FryRecipe(
+
+    :FISH_STANDARD,
+
+    :FISH,
+
+    FISH_FRY,
+
+    175.0,
+
+    210.0,
+
+    20.0,
+
+    6.0,
+
+    165.0
+)
+
+
+# ============================================================
+# SENSOR SNAPSHOT
+# ============================================================
+
+mutable struct SensorSnapshot
+
+    oil_temperature_c::Float64
+
+    oil_level_ok::Bool
+
+    basket_position::BasketState
+
+    basket_present::Bool
+
+    basket_load_kg::Float64
+
+    emergency_stop::Bool
+
+    heater_available::Bool
+
+    burner_ok::Bool
+
+    door_closed::Bool
+
+    drain_closed::Bool
+
+    temperature_sensor_ok::Bool
+
+    pressure_ok::Bool
+
+    oil_quality_index::Float64
+
+end
+
+
+function SensorSnapshot()
+
+    SensorSnapshot(
+
+        20.0,
+
+        true,
+
+        BASKET_UP,
+
+        true,
+
+        0.0,
+
+        false,
+
+        true,
+
+        true,
+
+        true,
+
+        true,
+
+        true,
+
+        true,
+
+        100.0
+
+    )
+
+end
+
+
+# ============================================================
+# ACTUATOR STATE
+# ============================================================
+
+mutable struct ActuatorState
+
+    heat_request::Bool
+
+    basket_lower_request::Bool
+
+    basket_raise_request::Bool
+
+    drain_request::Bool
+
+    service_alarm::Bool
+
+end
+
+
+function ActuatorState()
+
+    ActuatorState(
+
+        false,
+
+        false,
+
+        false,
+
+        false,
+
+        false
+
+    )
+
+end
+
+
+# ============================================================
+# SAFE ACTUATOR STATE
+# ============================================================
+
+function safe_outputs!(
+    a::ActuatorState
+)
+
+    a.heat_request = false
+    a.basket_lower_request = false
+    a.basket_raise_request = false
+    a.drain_request = false
+
+end
+
+
+# ============================================================
+# ALARM
+# ============================================================
+
+struct Alarm
+
+    code::Symbol
+
+    severity::AlarmSeverity
+
+    message::String
+
+    timestamp::DateTime
+
+end
+
+
+# ============================================================
+# PRODUCTION RECORD
+# ============================================================
+
+mutable struct ProductionRecord
+
+    batch_id::UInt64
+
+    product::Symbol
+
+    recipe::Symbol
+
+    start_time::DateTime
+
+    end_time::Union{Nothing,DateTime}
+
+    input_mass_kg::Float64
+
+    target_temperature_c::Float64
+
+    actual_temperature_min_c::Float64
+
+    actual_temperature_max_c::Float64
+
+    cook_time_s::Float64
+
+    successful::Bool
+
+end
+
+
+# ============================================================
+# VAT
+# ============================================================
+
+mutable struct FryVat
+
+    id::Int
+
+    state::FryerState
+
+    recipe::FryRecipe
+
+    sensors::SensorSnapshot
+
+    actuators::ActuatorState
+
+    current_stage::CookStage
+
+    elapsed_s::Float64
+
+    drain_elapsed_s::Float64
+
+    batch_id::UInt64
+
+    production::Vector{ProductionRecord}
+
+    alarms::Vector{Alarm}
+
+end
+
+
+# ============================================================
+# VAT CONSTRUCTOR
+# ============================================================
+
+function FryVat(
+
+    id::Int,
+
+    recipe::FryRecipe
+
+)
+
+    FryVat(
+
+        id,
+
+        POWER_OFF,
+
+        recipe,
+
+        SensorSnapshot(),
+
+        ActuatorState(),
+
+        NO_STAGE,
+
+        0.0,
+
+        0.0,
+
+        UInt64(0),
+
+        ProductionRecord[],
+
+        Alarm[]
+
+    )
+
+end
+
+
+# ============================================================
+# ALARM MANAGEMENT
+# ============================================================
+
+function raise_alarm!(
+
+    vat::FryVat,
+
+    code::Symbol,
+
+    severity::AlarmSeverity,
+
+    message::String
+
+)
+
+    push!(
+
+        vat.alarms,
+
+        Alarm(
+
+            code,
+
+            severity,
+
+            message,
+
+            now()
+
+        )
+
+    )
+
+end
+
+
+function clear_alarms!(vat::FryVat)
+
+    empty!(vat.alarms)
+
+    vat.actuators.service_alarm = false
+
+end
+
+
+# ============================================================
+# SAFETY PERMISSION
+# ============================================================
+
+function hardware_safe(
+    vat::FryVat
+)
+
+    s = vat.sensors
+
+
+    if s.emergency_stop
+        return false
+    end
+
+
+    if !s.oil_level_ok
+        return false
+    end
+
+
+    if !s.heater_available
+        return false
+    end
+
+
+    if !s.burner_ok
+        return false
+    end
+
+
+    if !s.door_closed
+        return false
+    end
+
+
+    if !s.drain_closed
+        return false
+    end
+
+
+    if !s.temperature_sensor_ok
+        return false
+    end
+
+
+    if !s.pressure_ok
+        return false
+    end
+
+
+    return true
+
+end
+
+
+# ============================================================
+# HARD SAFETY RESPONSE
+# ============================================================
+
+function emergency_shutdown!(
+
+    vat::FryVat,
+
+    code::Symbol,
+
+    message::String
+
+)
+
+    safe_outputs!(vat.actuators)
+
+    vat.state = FAULT
+
+    vat.actuators.service_alarm = true
+
+
+    raise_alarm!(
+
+        vat,
+
+        code,
+
+        CRITICAL,
+
+        message
+
+    )
+
+end
+
+
+# ============================================================
+# POWER UP
+# ============================================================
+
+function power_on!(vat::FryVat)
+
+    safe_outputs!(vat.actuators)
+
+    vat.state = INITIALISING
+
+    vat.elapsed_s = 0.0
+
+end
+
+
+# ============================================================
+# INITIALISATION
+# ============================================================
+
+function initialise!(vat::FryVat)
+
+    if !hardware_safe(vat)
+
+        emergency_shutdown!(
+
+            vat,
+
+            :INITIALISATION_FAILURE,
+
+            "Fryer safety conditions not satisfied"
+
+        )
+
+        return false
+
+    end
+
+
+    vat.state = PREHEATING
+
+    vat.current_stage = NO_STAGE
+
+    return true
+
+end
+
+
+# ============================================================
+# THERMAL CONTROLLER
+#
+# Supervisory hysteresis controller.
+#
+# A production implementation can substitute a validated
+# hardware/PLC PID controller.
+# ============================================================
+
+function thermal_control!(
+
+    vat::FryVat,
+
+    target_c::Float64
+
+)
+
+    temperature =
+        vat.sensors.oil_temperature_c
+
+
+    if temperature >= target_c
+
+        vat.actuators.heat_request = false
+
+
+    elseif temperature <
+           target_c - 2.0
+
+        vat.actuators.heat_request = true
+
+    end
+
+end
+
+
+# ============================================================
+# PREHEAT
+# ============================================================
+
+function update_preheat!(
+
+    vat::FryVat,
+
+    dt_s::Float64
+
+)
+
+    thermal_control!(
+
+        vat,
+
+        vat.recipe.target_temperature_c
+
+    )
+
+
+    if vat.sensors.oil_temperature_c >=
+       vat.recipe.target_temperature_c
+
+        vat.actuators.heat_request = false
+
+        vat.state = READY
+
+        vat.elapsed_s = 0.0
+
+    end
+
+end
+
+
+# ============================================================
+# BATCH CREATION
+# ============================================================
+
+function begin_batch!(
+
+    vat::FryVat,
+
+    product::Symbol,
+
+    mass_kg::Float64
+
+)
+
+    if vat.state != READY
+
+        return false
+
+    end
+
+
+    if !hardware_safe(vat)
+
+        return false
+
+    end
+
+
+    if !vat.sensors.basket_present
+
+        raise_alarm!(
+
+            vat,
+
+            :BASKET_MISSING,
+
+            WARNING,
+
+            "Basket not detected"
+
+        )
+
+        return false
+
+    end
+
+
+    if mass_kg <= 0.0
+
+        return false
+
+    end
+
+
+    if mass_kg >
+       vat.recipe.maximum_batch_mass_kg
+
+        raise_alarm!(
+
+            vat,
+
+            :OVERLOAD,
+
+            CRITICAL,
+
+            "Batch mass exceeds configured limit"
+
+        )
+
+        return false
+
+    end
+
+
+    vat.batch_id += 1
+
+    vat.elapsed_s = 0.0
+
+    vat.drain_elapsed_s = 0.0
+
+    vat.current_stage =
+        vat.recipe.stage
+
+    vat.sensors.basket_load_kg =
+        mass_kg
+
+    vat.state = LOADING
+
+    return true
+
+end
+
+
+# ============================================================
+# LOWER BASKET
+# ============================================================
+
+function lower_basket!(vat::FryVat)
+
+    if vat.state != LOADING
+
+        return false
+
+    end
+
+
+    if !hardware_safe(vat)
+
+        emergency_shutdown!(
+
+            vat,
+
+            :LOAD_INTERLOCK,
+
+            "Unsafe condition during loading"
+
+        )
+
+        return false
+
+    end
+
+
+    vat.actuators.basket_lower_request =
+        true
+
+    return true
+
+end
+
+
+# ============================================================
+# BASKET REACHED OIL
+# ============================================================
+
+function basket_down!(vat::FryVat)
+
+    vat.actuators.basket_lower_request =
+        false
+
+    vat.sensors.basket_position =
+        BASKET_DOWN
+
+    vat.state = COOKING
+
+    vat.elapsed_s = 0.0
+
+    vat.current_stage =
+        vat.recipe.stage
+
+end
+
+
+# ============================================================
+# COOKING ENGINE
+# ============================================================
+
+function update_cooking!(
+
+    vat::FryVat,
+
+    dt_s::Float64
+
+)
+
+    if !hardware_safe(vat)
+
+        emergency_shutdown!(
+
+            vat,
+
+            :COOKING_SAFETY_FAILURE,
+
+            "Safety condition lost during cooking"
+
+        )
+
+        return :fault
+
+    end
+
+
+    # --------------------------------------------------------
+    # Temperature control
+    # --------------------------------------------------------
+
+    thermal_control!(
+
+        vat,
+
+        vat.recipe.target_temperature_c
+
+    )
+
+
+    # --------------------------------------------------------
+    # Minimum temperature protection
+    # --------------------------------------------------------
+
+    if vat.sensors.oil_temperature_c <
+       vat.recipe.minimum_temperature_c
+
+        raise_alarm!(
+
+            vat,
+
+            :LOW_OIL_TEMPERATURE,
+
+            WARNING,
+
+            "Oil temperature below recipe minimum"
+
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # Advance timer
+    # --------------------------------------------------------
+
+    vat.elapsed_s += dt_s
+
+
+    # --------------------------------------------------------
+    # Cooking complete
+    # --------------------------------------------------------
+
+    if vat.elapsed_s >=
+       vat.recipe.cook_time_s
+
+        vat.actuators.heat_request = false
+
+        vat.actuators.basket_raise_request =
+            true
+
+        vat.state = DRAINING
+
+        vat.drain_elapsed_s = 0.0
+
+        return :complete
+
+    end
+
+
+    return :cooking
+
+end
+
+
+# ============================================================
+# DRAINING
+# ============================================================
+
+function update_draining!(
+
+    vat::FryVat,
+
+    dt_s::Float64
+
+)
+
+    vat.actuators.heat_request = false
+
+    vat.actuators.basket_raise_request =
+        true
+
+
+    if vat.sensors.basket_position !=
+       BASKET_UP
+
+        return :raising
+
+    end
+
+
+    vat.actuators.basket_raise_request =
+        false
+
+
+    vat.drain_elapsed_s += dt_s
+
+
+    if vat.drain_elapsed_s >=
+       vat.recipe.drain_time_s
+
+        vat.state = HOLDING
+
+        return :holding
+
+    end
+
+
+    return :draining
+
+end
+
+
+# ============================================================
+# COMPLETE BATCH
+# ============================================================
+
+function complete_batch!(
+
+    vat::FryVat
+
+)
+
+    if vat.state != HOLDING
+
+        return false
+
+    end
+
+
+    push!(
+
+        vat.production,
+
+        ProductionRecord(
+
+            vat.batch_id,
+
+            vat.recipe.product,
+
+            vat.recipe.name,
+
+            now(),
+
+            now(),
+
+            vat.sensors.basket_load_kg,
+
+            vat.recipe.target_temperature_c,
+
+            vat.recipe.target_temperature_c,
+
+            vat.recipe.target_temperature_c,
+
+            vat.recipe.cook_time_s,
+
+            true
+
+        )
+
+    )
+
+
+    vat.sensors.basket_load_kg = 0.0
+
+    vat.current_stage = NO_STAGE
+
+    vat.state = READY
+
+    vat.elapsed_s = 0.0
+
+    vat.drain_elapsed_s = 0.0
+
+    return true
+
+end
+
+
+# ============================================================
+# OIL QUALITY ENGINE
+# ============================================================
+
+function evaluate_oil!(vat::FryVat)
+
+    quality =
+        vat.sensors.oil_quality_index
+
+
+    if quality < 20.0
+
+        raise_alarm!(
+
+            vat,
+
+            :OIL_CRITICAL,
+
+            CRITICAL,
+
+            "Oil quality critically degraded"
+
+        )
+
+
+    elseif quality < 40.0
+
+        raise_alarm!(
+
+            vat,
+
+            :OIL_LOW,
+
+            WARNING,
+
+            "Oil quality requires attention"
+
+        )
+
+
+    elseif quality < 60.0
+
+        raise_alarm!(
+
+            vat,
+
+            :OIL_DEGRADING,
+
+            INFO,
+
+            "Oil quality declining"
+
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# CLEANING MODE
+# ============================================================
+
+function start_cleaning!(vat::FryVat)
+
+    safe_outputs!(vat.actuators)
+
+    vat.state = CLEANING
+
+    return true
+
+end
+
+
+function finish_cleaning!(vat::FryVat)
+
+    safe_outputs!(vat.actuators)
+
+    vat.state = INITIALISING
+
+    return true
+
+end
+
+
+# ============================================================
+# SERVICE MODE
+# ============================================================
+
+function enter_service!(vat::FryVat)
+
+    safe_outputs!(vat.actuators)
+
+    vat.state = SERVICE
+
+end
+
+
+function exit_service!(vat::FryVat)
+
+    safe_outputs!(vat.actuators)
+
+    vat.state = INITIALISING
+
+end
+
+
+# ============================================================
+# FAULT RESET
+# ============================================================
+
+function reset_fault!(vat::FryVat)
+
+    if vat.state != FAULT
+
+        return true
+
+    end
+
+
+    if !hardware_safe(vat)
+
+        return false
+
+    end
+
+
+    clear_alarms!(vat)
+
+    vat.state = INITIALISING
+
+    return true
+
+end
+
+
+# ============================================================
+# MASTER UPDATE
+# ============================================================
+
+function update!(
+
+    vat::FryVat,
+
+    dt_s::Float64
+
+)
+
+    # ========================================================
+    # GLOBAL SAFETY SUPERVISION
+    # ========================================================
+
+    if vat.state in (
+
+        PREHEATING,
+        READY,
+        LOADING,
+        COOKING,
+        DRAINING
+
+    )
+
+        if !hardware_safe(vat)
+
+            emergency_shutdown!(
+
+                vat,
+
+                :GLOBAL_SAFETY,
+
+                "Global safety interlock activated"
+
+            )
+
+            return :fault
+
+        end
+
+    end
+
+
+    # ========================================================
+    # STATE MACHINE
+    # ========================================================
+
+    if vat.state == INITIALISING
+
+        initialise!(vat)
+
+        return :initialising
+
+
+    elseif vat.state == PREHEATING
+
+        update_preheat!(
+
+            vat,
+
+            dt_s
+
+        )
+
+        return :preheating
+
+
+    elseif vat.state == READY
+
+        return :ready
+
+
+    elseif vat.state == COOKING
+
+        return update_cooking!(
+
+            vat,
+
+            dt_s
+
+        )
+
+
+    elseif vat.state == DRAINING
+
+        return update_draining!(
+
+            vat,
+
+            dt_s
+
+        )
+
+
+    elseif vat.state == HOLDING
+
+        return :holding
+
+
+    elseif vat.state == CLEANING
+
+        safe_outputs!(vat.actuators)
+
+        return :cleaning
+
+
+    elseif vat.state == SERVICE
+
+        safe_outputs!(vat.actuators)
+
+        return :service
+
+
+    elseif vat.state == FAULT
+
+        safe_outputs!(vat.actuators)
+
+        return :fault
+
+    end
+
+
+    return :idle
+
+end
+
+
+# ============================================================
+# PRODUCTION STATISTICS
+# ============================================================
+
+function batches_completed(
+
+    vat::FryVat
+
+)
+
+    count(
+
+        record -> record.successful,
+
+        vat.production
+
+    )
+
+end
+
+
+function total_mass(
+
+    vat::FryVat
+
+)
+
+    sum(
+
+        record.input_mass_kg
+
+        for record in vat.production
+
+        if record.successful
+
+    )
+
+end
+
+
+# ============================================================
+# PRODUCTION REPORT
+# ============================================================
+
+function production_report(
+
+    vat::FryVat
+
+)
+
+    println()
+    println("==============================================")
+    println("             FISHFRYER.OS")
+    println("          PRODUCTION REPORT")
+    println("==============================================")
+
+    println(
+        "VAT                 : ",
+        vat.id
+    )
+
+    println(
+        "STATE               : ",
+        vat.state
+    )
+
+    println(
+        "PRODUCT             : ",
+        vat.recipe.product
+    )
+
+    println(
+        "RECIPE              : ",
+        vat.recipe.name
+    )
+
+    println(
+        "BATCHES             : ",
+        batches_completed(vat)
+    )
+
+    println(
+        "TOTAL PRODUCT       : ",
+        round(
+            total_mass(vat),
+            digits=2
+        ),
+        " kg"
+    )
+
+    println(
+        "OIL TEMPERATURE     : ",
+        round(
+            vat.sensors.oil_temperature_c,
+            digits=1
+        ),
+        " °C"
+    )
+
+    println(
+        "OIL QUALITY         : ",
+        round(
+            vat.sensors.oil_quality_index,
+            digits=1
+        ),
+        "%"
+    )
+
+    println(
+        "ACTIVE ALARMS       : ",
+        length(vat.alarms)
+    )
+
+    println("==============================================")
+
+end
+
+
+# ============================================================
+# MULTI-VAT FRYER
+# ============================================================
+
+mutable struct ProductionFryer
+
+    vats::Vector{FryVat}
+
+    total_batches::UInt64
+
+    total_product_kg::Float64
+
+end
+
+
+# ============================================================
+# FACTORY
+# ============================================================
+
+function ProductionFryer(
+
+    vat_count::Int
+
+)
+
+    vats = FryVat[]
+
+
+    for i in 1:vat_count
+
+        recipe =
+            i == 1 ?
+            CHIPS_STANDARD :
+            FISH_STANDARD
+
+
+        push!(
+
+            vats,
+
+            FryVat(
+
+                i,
+
+                recipe
+
+            )
+
+        )
+
+    end
+
+
+    ProductionFryer(
+
+        vats,
+
+        UInt64(0),
+
+        0.0
+
+    )
+
+end
+
+
+# ============================================================
+# MASTER FRYER UPDATE
+# ============================================================
+
+function update!(
+
+    fryer::ProductionFryer,
+
+    dt_s::Float64
+
+)
+
+    for vat in fryer.vats
+
+        previous =
+            batches_completed(vat)
+
+
+        update!(
+
+            vat,
+
+            dt_s
+
+        )
+
+
+        current =
+            batches_completed(vat)
+
+
+        if current > previous
+
+            fryer.total_batches += 1
+
+            fryer.total_product_kg +=
+                vat.production[end].input_mass_kg
+
+        end
+
+    end
+
+end
+
+
+# ============================================================
+# FACTORY STATUS
+# ============================================================
+
+function status(
+
+    fryer::ProductionFryer
+
+)
+
+    println()
+    println("================================================")
+    println("              FISHFRYER.OS")
+    println("        PRODUCTION FRYER SYSTEM")
+    println("================================================")
+
+    println(
+        "TOTAL BATCHES : ",
+        fryer.total_batches
+    )
+
+    println(
+        "TOTAL PRODUCT : ",
+        round(
+            fryer.total_product_kg,
+            digits=2
+        ),
+        " kg"
+    )
+
+
+    for vat in fryer.vats
+
+        println()
+        println(
+            "VAT ",
+            vat.id,
+            " | ",
+            vat.state,
+            " | ",
+            vat.recipe.name,
+            " | ",
+            round(
+                vat.sensors.oil_temperature_c,
+                digits=1
+            ),
+            " °C"
+        )
+
+    end
+
+
+    println("================================================")
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    fryer =
+        ProductionFryer(3)
+
+
+    # --------------------------------------------------------
+    # Power up all vats
+    # --------------------------------------------------------
+
+    for vat in fryer.vats
+
+        power_on!(vat)
+
+    end
+
+
+    # --------------------------------------------------------
+    # Simulated production loop
+    # --------------------------------------------------------
+
+    for tick in 1:600
+
+        # Simulation only.
+        #
+        # A real system would receive these values from
+        # hardware interfaces.
+
+        for vat in fryer.vats
+
+            if vat.actuators.heat_request
+
+                vat.sensors.oil_temperature_c +=
+                    0.6
+
+            else
+
+                vat.sensors.oil_temperature_c -=
+                    0.02
+
+            end
+
+
+            vat.sensors.oil_temperature_c =
+                max(
+
+                    20.0,
+
+                    vat.sensors.oil_temperature_c
+
+                )
+
+
+            update!(
+
+                vat,
+
+                1.0
+
+            )
+
+
+            # Automatically load a demonstration batch.
+            if vat.state == READY
+
+                begin_batch!(
+
+                    vat,
+
+                    vat.recipe.product,
+
+                    min(
+
+                        4.0,
+
+                        vat.recipe.maximum_batch_mass_kg
+
+                    )
+
+                )
+
+                lower_basket!(vat)
+
+                basket_down!(vat)
+
+            end
+
+
+            if vat.state == HOLDING
+
+                complete_batch!(vat)
+
+            end
+
+
+            evaluate_oil!(vat)
+
+        end
+
+    end
+
+
+    status(fryer)
+
+
+    for vat in fryer.vats
+
+        production_report(vat)
+
+    end
+
+end
+
+
+end # module
+
+
+# ============================================================
+# START
+# ============================================================
+
+using .FishFryerOS
+
+FishFryerOS.demo()
