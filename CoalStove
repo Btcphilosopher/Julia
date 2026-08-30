@@ -1,0 +1,909 @@
+module ModernCoalStoveOS
+
+using Dates
+
+# ============================================================
+# MODERN COAL STOVE OS
+# Pure Julia
+#
+# Architecture:
+#
+#   SENSORS
+#      │
+#      ▼
+#   SAFETY LAYER
+#      │
+#      ▼
+#   THERMAL MODEL
+#      │
+#      ▼
+#   COMBUSTION STATE MACHINE
+#      │
+#      ▼
+#   AIRFLOW / CONTROL DEMAND
+#      │
+#      ▼
+#   STATUS + TELEMETRY
+#
+# Software is supervisory only.
+# Physical over-temperature and CO protection must be
+# independent hardware/mechanical systems.
+# ============================================================
+
+
+# ============================================================
+# STATES
+# ============================================================
+
+@enum StoveState begin
+    OFF
+    STARTING
+    IGNITING
+    BURNING
+    HOLDING
+    COOLING
+    LOW_FUEL
+    OVERHEAT
+    FAULT
+end
+
+
+# ============================================================
+# AIRFLOW MODES
+# ============================================================
+
+@enum AirMode begin
+    CLOSED
+    LOW
+    MEDIUM
+    HIGH
+end
+
+
+# ============================================================
+# SENSOR MODEL
+# ============================================================
+
+Base.@kwdef mutable struct StoveSensors
+
+    stove_temperature_c::Float64 = 20.0
+
+    flue_temperature_c::Float64 = 20.0
+
+    room_temperature_c::Float64 = 20.0
+
+    oxygen_percent::Float64 = 20.9
+
+    carbon_monoxide_ppm::Float64 = 0.0
+
+    fuel_remaining_kg::Float64 = 0.0
+
+    door_closed::Bool = true
+
+    chimney_ok::Bool = true
+
+    thermal_trip::Bool = false
+
+end
+
+
+# ============================================================
+# CONTROL LIMITS
+# ============================================================
+
+Base.@kwdef struct StoveLimits
+
+    target_temperature_c::Float64 = 250.0
+
+    minimum_burn_temperature_c::Float64 = 120.0
+
+    holding_temperature_c::Float64 = 180.0
+
+    cooling_temperature_c::Float64 = 80.0
+
+    maximum_temperature_c::Float64 = 400.0
+
+    maximum_flue_temperature_c::Float64 = 350.0
+
+    maximum_co_ppm::Float64 = 50.0
+
+    minimum_oxygen_percent::Float64 = 17.0
+
+    minimum_fuel_kg::Float64 = 0.20
+
+end
+
+
+# ============================================================
+# AIRFLOW COMMAND
+# ============================================================
+
+Base.@kwdef mutable struct AirControl
+
+    primary::Float64 = 0.0
+
+    secondary::Float64 = 0.0
+
+    tertiary::Float64 = 0.0
+
+    mode::AirMode = CLOSED
+
+end
+
+
+# ============================================================
+# TELEMETRY
+# ============================================================
+
+struct Telemetry
+
+    timestamp::DateTime
+
+    state::StoveState
+
+    stove_temperature_c::Float64
+
+    flue_temperature_c::Float64
+
+    room_temperature_c::Float64
+
+    oxygen_percent::Float64
+
+    carbon_monoxide_ppm::Float64
+
+    fuel_remaining_kg::Float64
+
+    primary_air::Float64
+
+    secondary_air::Float64
+
+end
+
+
+# ============================================================
+# STOVE
+# ============================================================
+
+mutable struct CoalStove
+
+    state::StoveState
+
+    sensors::StoveSensors
+
+    limits::StoveLimits
+
+    air::AirControl
+
+    elapsed_s::Float64
+
+    burn_time_s::Float64
+
+    telemetry::Vector{Telemetry}
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function CoalStove(
+    sensors = StoveSensors(),
+    limits = StoveLimits()
+)
+
+    CoalStove(
+
+        OFF,
+
+        sensors,
+
+        limits,
+
+        AirControl(),
+
+        0.0,
+
+        0.0,
+
+        Telemetry[]
+
+    )
+
+end
+
+
+# ============================================================
+# HARD SAFETY CHECK
+# ============================================================
+
+function safety_fault(
+    stove::CoalStove
+)
+
+    s = stove.sensors
+    l = stove.limits
+
+    s.thermal_trip ||
+    !s.chimney_ok ||
+    s.carbon_monoxide_ppm >= l.maximum_co_ppm ||
+    s.oxygen_percent < l.minimum_oxygen_percent ||
+    s.stove_temperature_c >= l.maximum_temperature_c ||
+    s.flue_temperature_c >= l.maximum_flue_temperature_c
+
+end
+
+
+# ============================================================
+# AIR CONTROL
+# ============================================================
+
+function close_air!(
+    stove::CoalStove
+)
+
+    stove.air.primary = 0.0
+    stove.air.secondary = 0.0
+    stove.air.tertiary = 0.0
+
+    stove.air.mode = CLOSED
+
+end
+
+
+function low_air!(
+    stove::CoalStove
+)
+
+    stove.air.primary = 0.20
+    stove.air.secondary = 0.20
+    stove.air.tertiary = 0.10
+
+    stove.air.mode = LOW
+
+end
+
+
+function medium_air!(
+    stove::CoalStove
+)
+
+    stove.air.primary = 0.45
+    stove.air.secondary = 0.50
+    stove.air.tertiary = 0.30
+
+    stove.air.mode = MEDIUM
+
+end
+
+
+function high_air!(
+    stove::CoalStove
+)
+
+    stove.air.primary = 0.70
+    stove.air.secondary = 0.75
+    stove.air.tertiary = 0.50
+
+    stove.air.mode = HIGH
+
+end
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+function start!(
+    stove::CoalStove
+)
+
+    if safety_fault(stove)
+
+        stove.state = FAULT
+
+        close_air!(stove)
+
+        return false
+
+    end
+
+
+    if !stove.sensors.door_closed
+
+        return false
+
+    end
+
+
+    if stove.sensors.fuel_remaining_kg <= 0
+
+        stove.state = LOW_FUEL
+
+        return false
+
+    end
+
+
+    stove.state = STARTING
+
+    stove.elapsed_s = 0.0
+
+    high_air!(stove)
+
+    true
+
+end
+
+
+# ============================================================
+# STOP
+# ============================================================
+
+function stop!(
+    stove::CoalStove
+)
+
+    close_air!(stove)
+
+    stove.state = COOLING
+
+    stove.elapsed_s = 0.0
+
+end
+
+
+# ============================================================
+# FAULT
+# ============================================================
+
+function fault!(
+    stove::CoalStove
+)
+
+    close_air!(stove)
+
+    stove.state = FAULT
+
+end
+
+
+# ============================================================
+# TARGET TEMPERATURE CONTROL
+# ============================================================
+
+function temperature_error(
+    stove::CoalStove
+)
+
+    stove.limits.target_temperature_c -
+    stove.sensors.stove_temperature_c
+
+end
+
+
+# ============================================================
+# THERMAL CONTROLLER
+# ============================================================
+
+function regulate_air!(
+    stove::CoalStove
+)
+
+    error =
+        temperature_error(stove)
+
+
+    # --------------------------------------------------------
+    # WELL ABOVE TARGET
+    # --------------------------------------------------------
+
+    if error < -50
+
+        low_air!(stove)
+
+
+    # --------------------------------------------------------
+    # SLIGHTLY ABOVE TARGET
+    # --------------------------------------------------------
+
+    elseif error < 0
+
+        low_air!(stove)
+
+
+    # --------------------------------------------------------
+    # CLOSE TO TARGET
+    # --------------------------------------------------------
+
+    elseif error < 40
+
+        medium_air!(stove)
+
+
+    # --------------------------------------------------------
+    # BELOW TARGET
+    # --------------------------------------------------------
+
+    else
+
+        high_air!(stove)
+
+    end
+
+end
+
+
+# ============================================================
+# STARTUP CONTROL
+# ============================================================
+
+function process_startup!(
+    stove::CoalStove
+)
+
+    high_air!(stove)
+
+
+    if stove.sensors.stove_temperature_c >=
+       stove.limits.minimum_burn_temperature_c
+
+        stove.state = BURNING
+
+        stove.elapsed_s = 0.0
+
+    end
+
+end
+
+
+# ============================================================
+# BURN CONTROL
+# ============================================================
+
+function process_burning!(
+    stove::CoalStove
+)
+
+    # Temperature regulation
+
+    regulate_air!(stove)
+
+
+    # Low fuel
+
+    if stove.sensors.fuel_remaining_kg <=
+       stove.limits.minimum_fuel_kg
+
+        stove.state = LOW_FUEL
+
+        return
+
+    end
+
+
+    # Excessively high temperature
+
+    if stove.sensors.stove_temperature_c >=
+       stove.limits.maximum_temperature_c
+
+        fault!(stove)
+
+        return
+
+    end
+
+
+    # Stable low-power condition
+
+    if stove.sensors.stove_temperature_c >=
+       stove.limits.holding_temperature_c &&
+       stove.sensors.stove_temperature_c <
+       stove.limits.target_temperature_c - 20
+
+        stove.state = HOLDING
+
+    end
+
+end
+
+
+# ============================================================
+# HOLDING CONTROL
+# ============================================================
+
+function process_holding!(
+    stove::CoalStove
+)
+
+    low_air!(stove)
+
+
+    if stove.sensors.stove_temperature_c <
+       stove.limits.holding_temperature_c
+
+        stove.state = BURNING
+
+    end
+
+
+    if stove.sensors.fuel_remaining_kg <=
+       stove.limits.minimum_fuel_kg
+
+        stove.state = LOW_FUEL
+
+    end
+
+end
+
+
+# ============================================================
+# LOW FUEL
+# ============================================================
+
+function process_low_fuel!(
+    stove::CoalStove
+)
+
+    low_air!(stove)
+
+
+    if stove.sensors.stove_temperature_c <
+       stove.limits.cooling_temperature_c
+
+        stove.state = COOLING
+
+    end
+
+end
+
+
+# ============================================================
+# COOLING
+# ============================================================
+
+function process_cooling!(
+    stove::CoalStove
+)
+
+    close_air!(stove)
+
+
+    if stove.sensors.stove_temperature_c <=
+       stove.limits.cooling_temperature_c
+
+        stove.state = OFF
+
+    end
+
+end
+
+
+# ============================================================
+# MAIN CONTROL LOOP
+# ============================================================
+
+function update!(
+    stove::CoalStove,
+    dt_s::Real
+)
+
+    dt = max(Float64(dt_s), 0.0)
+
+    stove.elapsed_s += dt
+
+
+    # --------------------------------------------------------
+    # GLOBAL SAFETY
+    # --------------------------------------------------------
+
+    if safety_fault(stove)
+
+        fault!(stove)
+
+        return stove.state
+
+    end
+
+
+    # --------------------------------------------------------
+    # STATE MACHINE
+    # --------------------------------------------------------
+
+    if stove.state == OFF
+
+        close_air!(stove)
+
+
+    elseif stove.state == STARTING
+
+        process_startup!(stove)
+
+
+    elseif stove.state == IGNITING
+
+        process_startup!(stove)
+
+
+    elseif stove.state == BURNING
+
+        process_burning!(stove)
+
+        stove.burn_time_s += dt
+
+
+    elseif stove.state == HOLDING
+
+        process_holding!(stove)
+
+        stove.burn_time_s += dt
+
+
+    elseif stove.state == LOW_FUEL
+
+        process_low_fuel!(stove)
+
+
+    elseif stove.state == COOLING
+
+        process_cooling!(stove)
+
+
+    elseif stove.state == FAULT
+
+        close_air!(stove)
+
+    end
+
+
+    record_telemetry!(stove)
+
+
+    stove.state
+
+end
+
+
+# ============================================================
+# TELEMETRY
+# ============================================================
+
+function record_telemetry!(
+    stove::CoalStove
+)
+
+    s = stove.sensors
+    a = stove.air
+
+
+    push!(
+
+        stove.telemetry,
+
+        Telemetry(
+
+            now(),
+
+            stove.state,
+
+            s.stove_temperature_c,
+
+            s.flue_temperature_c,
+
+            s.room_temperature_c,
+
+            s.oxygen_percent,
+
+            s.carbon_monoxide_ppm,
+
+            s.fuel_remaining_kg,
+
+            a.primary,
+
+            a.secondary
+
+        )
+
+    )
+
+end
+
+
+# ============================================================
+# ENERGY ESTIMATE
+# ============================================================
+
+function estimated_thermal_output(
+    stove::CoalStove,
+    fuel_rate_kg_h::Float64,
+    coal_energy_mj_kg::Float64 = 24.0
+)
+
+    fuel_rate_kg_h *
+    coal_energy_mj_kg
+
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function status(
+    stove::CoalStove
+)
+
+    s = stove.sensors
+    a = stove.air
+
+
+    println()
+    println("="^ sixty_four())
+
+    println("                 COALSTOVE.OS")
+
+    println("="^ sixty_four())
+
+    println()
+
+    println("STATE       : ", stove.state)
+
+    println(
+        "STOVE TEMP  : ",
+        round(s.stove_temperature_c, digits=1),
+        " °C"
+    )
+
+    println(
+        "FLUE TEMP   : ",
+        round(s.flue_temperature_c, digits=1),
+        " °C"
+    )
+
+    println(
+        "ROOM TEMP   : ",
+        round(s.room_temperature_c, digits=1),
+        " °C"
+    )
+
+    println(
+        "OXYGEN      : ",
+        round(s.oxygen_percent, digits=2),
+        " %"
+    )
+
+    println(
+        "CO          : ",
+        round(s.carbon_monoxide_ppm, digits=1),
+        " ppm"
+    )
+
+    println(
+        "FUEL        : ",
+        round(s.fuel_remaining_kg, digits=2),
+        " kg"
+    )
+
+    println()
+
+    println("AIR CONTROL")
+
+    println(
+        "MODE        : ",
+        a.mode
+    )
+
+    println(
+        "PRIMARY     : ",
+        round(a.primary * 100, digits=1),
+        "%"
+    )
+
+    println(
+        "SECONDARY   : ",
+        round(a.secondary * 100, digits=1),
+        "%"
+    )
+
+    println(
+        "TERTIARY    : ",
+        round(a.tertiary * 100, digits=1),
+        "%"
+    )
+
+    println()
+
+    println(
+        "BURN TIME   : ",
+        round(stove.burn_time_s / 3600, digits=2),
+        " h"
+    )
+
+    println(
+        "SAFETY      : ",
+        safety_fault(stove) ?
+        "FAULT" :
+        "OK"
+    )
+
+    println("="^ sixty_four())
+
+end
+
+
+sixty_four() = 64
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    sensors = StoveSensors(
+
+        stove_temperature_c = 180.0,
+
+        flue_temperature_c = 140.0,
+
+        room_temperature_c = 20.0,
+
+        oxygen_percent = 20.0,
+
+        carbon_monoxide_ppm = 0.0,
+
+        fuel_remaining_kg = 5.0,
+
+        door_closed = true,
+
+        chimney_ok = true,
+
+        thermal_trip = false
+
+    )
+
+
+    stove =
+        CoalStove(sensors)
+
+
+    println(
+        "INITIALISING COALSTOVE.OS"
+    )
+
+
+    if start!(stove)
+
+        println(
+            "STOVE STARTED"
+        )
+
+    end
+
+
+    for i in 1:10
+
+        update!(
+            stove,
+            10.0
+        )
+
+    end
+
+
+    status(stove)
+
+end
+
+
+end # module
+
+
+# ============================================================
+# RUN DEMO
+# ============================================================
+
+using .ModernCoalStoveOS
+
+ModernCoalStoveOS.demo()
+
