@@ -1,3 +1,12 @@
+DEVICE HydrogenLighter
+INPUT  battery_ok, safety_closed, gas_detected
+OUTPUT status
+
+IF battery_ok AND safety_closed AND NOT gas_detected
+    status = READY
+ELSE
+    status = LOCKED
+END
 # H2-LIGHTER.OS
 
 ## Minimal Embedded Rust Controller
