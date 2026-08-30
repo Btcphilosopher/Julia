@@ -1,0 +1,1828 @@
+module GuitarAmpOS
+
+# ============================================================
+# GUITARAMP.OS
+#
+# Pure Julia acoustic optimisation / DSP engine
+#
+# SIGNAL PATH
+#
+# Guitar
+#   │
+#   ▼
+# Input Conditioning
+#   │
+#   ▼
+# Noise Gate
+#   │
+#   ▼
+# Preamp
+#   │
+#   ▼
+# Tone Stack
+#   │
+#   ▼
+# Resonance Control
+#   │
+#   ▼
+# Cabinet Simulation
+#   │
+#   ▼
+# Room Compensation
+#   │
+#   ▼
+# Compressor
+#   │
+#   ▼
+# Limiter
+#   │
+#   ▼
+# Power Amp
+#   │
+#   ▼
+# Speaker
+#
+# The architecture is deliberately modular so the DSP can
+# eventually be connected to an ADC/DAC or audio interface.
+# ============================================================
+
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+const SAMPLE_RATE = 48_000.0
+const MAX_SAMPLE = 1.0
+const PI2 = 2π
+
+
+# ============================================================
+# UTILITIES
+# ============================================================
+
+clamp_sample(x) =
+    clamp(x, -MAX_SAMPLE, MAX_SAMPLE)
+
+
+function db_to_gain(db::Real)
+
+    10.0^(Float64(db) / 20.0)
+
+end
+
+
+function gain_to_db(gain::Real)
+
+    gain <= 0 && return -Inf
+
+    20.0 * log10(Float64(gain))
+
+end
+
+
+# ============================================================
+# AUDIO BUFFER
+# ============================================================
+
+mutable struct AudioBuffer
+
+    data::Vector{Float64}
+
+end
+
+
+AudioBuffer(n::Integer) =
+    AudioBuffer(
+        zeros(Float64, n)
+    )
+
+
+function clear!(buffer::AudioBuffer)
+
+    fill!(
+        buffer.data,
+        0.0
+    )
+
+end
+
+
+# ============================================================
+# BIQUAD FILTER
+# ============================================================
+
+mutable struct Biquad
+
+    b0::Float64
+    b1::Float64
+    b2::Float64
+
+    a1::Float64
+    a2::Float64
+
+    x1::Float64
+    x2::Float64
+
+    y1::Float64
+    y2::Float64
+
+end
+
+
+function Biquad()
+
+    Biquad(
+        1.0,
+        0.0,
+        0.0,
+
+        0.0,
+        0.0,
+
+        0.0,
+        0.0,
+
+        0.0,
+        0.0
+    )
+
+end
+
+
+function reset!(
+    f::Biquad
+)
+
+    f.x1 = 0.0
+    f.x2 = 0.0
+
+    f.y1 = 0.0
+    f.y2 = 0.0
+
+end
+
+
+function process!(
+    f::Biquad,
+    x::Float64
+)
+
+    y =
+        f.b0 * x +
+        f.b1 * f.x1 +
+        f.b2 * f.x2 -
+        f.a1 * f.y1 -
+        f.a2 * f.y2
+
+
+    f.x2 = f.x1
+    f.x1 = x
+
+    f.y2 = f.y1
+    f.y1 = y
+
+
+    y
+
+end
+
+
+# ============================================================
+# LOW PASS
+# ============================================================
+
+function lowpass!(
+    f::Biquad,
+    cutoff::Float64,
+    sample_rate::Float64
+)
+
+    ω =
+        PI2 *
+        cutoff /
+        sample_rate
+
+
+    α =
+        sin(ω) /
+        (2.0 * sqrt(2.0))
+
+
+    c =
+        cos(ω)
+
+
+    b0 = (1.0 - c) / 2.0
+    b1 = 1.0 - c
+    b2 = b0
+
+    a0 = 1.0 + α
+    a1 = -2.0 * c
+    a2 = 1.0 - α
+
+
+    f.b0 = b0 / a0
+    f.b1 = b1 / a0
+    f.b2 = b2 / a0
+
+    f.a1 = a1 / a0
+    f.a2 = a2 / a0
+
+end
+
+
+# ============================================================
+# HIGH PASS
+# ============================================================
+
+function highpass!(
+    f::Biquad,
+    cutoff::Float64,
+    sample_rate::Float64
+)
+
+    ω =
+        PI2 *
+        cutoff /
+        sample_rate
+
+
+    α =
+        sin(ω) /
+        (2.0 * sqrt(2.0))
+
+
+    c =
+        cos(ω)
+
+
+    b0 = (1.0 + c) / 2.0
+    b1 = -(1.0 + c)
+    b2 = b0
+
+    a0 = 1.0 + α
+    a1 = -2.0 * c
+    a2 = 1.0 - α
+
+
+    f.b0 = b0 / a0
+    f.b1 = b1 / a0
+    f.b2 = b2 / a0
+
+    f.a1 = a1 / a0
+    f.a2 = a2 / a0
+
+end
+
+
+# ============================================================
+# PEAK EQ
+# ============================================================
+
+function peaking!(
+    f::Biquad,
+    frequency::Float64,
+    gain_db::Float64,
+    Q::Float64,
+    sample_rate::Float64
+)
+
+    A =
+        10.0^(gain_db / 40.0)
+
+
+    ω =
+        PI2 *
+        frequency /
+        sample_rate
+
+
+    α =
+        sin(ω) /
+        (2.0 * Q)
+
+
+    c =
+        cos(ω)
+
+
+    b0 = 1.0 + α * A
+    b1 = -2.0 * c
+    b2 = 1.0 - α * A
+
+    a0 = 1.0 + α / A
+    a1 = -2.0 * c
+    a2 = 1.0 - α / A
+
+
+    f.b0 = b0 / a0
+    f.b1 = b1 / a0
+    f.b2 = b2 / a0
+
+    f.a1 = a1 / a0
+    f.a2 = a2 / a0
+
+end
+
+
+# ============================================================
+# TONE STACK
+# ============================================================
+
+mutable struct ToneStack
+
+    bass::Float64
+    middle::Float64
+    treble::Float64
+
+    bass_filter::Biquad
+    mid_filter::Biquad
+    treble_filter::Biquad
+
+end
+
+
+function ToneStack()
+
+    ToneStack(
+
+        0.5,
+        0.5,
+        0.5,
+
+        Biquad(),
+        Biquad(),
+        Biquad()
+    )
+
+end
+
+
+function configure!(
+    tone::ToneStack
+)
+
+    # Bass
+    peaking!(
+        tone.bass_filter,
+        120.0,
+        (tone.bass - 0.5) * 18.0,
+        0.8,
+        SAMPLE_RATE
+    )
+
+
+    # Midrange
+    peaking!(
+        tone.mid_filter,
+        900.0,
+        (tone.middle - 0.5) * 16.0,
+        1.0,
+        SAMPLE_RATE
+    )
+
+
+    # Treble
+    peaking!(
+        tone.treble_filter,
+        3500.0,
+        (tone.treble - 0.5) * 18.0,
+        0.8,
+        SAMPLE_RATE
+    )
+
+end
+
+
+function process!(
+    tone::ToneStack,
+    x::Float64
+)
+
+    x =
+        process!(
+            tone.bass_filter,
+            x
+        )
+
+
+    x =
+        process!(
+            tone.mid_filter,
+            x
+        )
+
+
+    x =
+        process!(
+            tone.treble_filter,
+            x
+        )
+
+
+    x
+
+end
+
+
+# ============================================================
+# PREAMP
+# ============================================================
+
+mutable struct Preamp
+
+    gain::Float64
+
+    drive::Float64
+
+end
+
+
+Preamp() =
+    Preamp(
+        2.0,
+        0.25
+    )
+
+
+function process!(
+    preamp::Preamp,
+    x::Float64
+)
+
+    driven =
+        x *
+        preamp.gain
+
+
+    # Smooth nonlinear tube-like transfer curve.
+
+    y =
+        tanh(
+            driven *
+            (1.0 + 5.0 * preamp.drive)
+        )
+
+
+    y
+
+end
+
+
+# ============================================================
+# NOISE GATE
+# ============================================================
+
+mutable struct NoiseGate
+
+    threshold::Float64
+
+    envelope::Float64
+
+    attack::Float64
+    release::Float64
+
+end
+
+
+NoiseGate() =
+    NoiseGate(
+        0.015,
+        0.0,
+        0.01,
+        0.001
+    )
+
+
+function process!(
+    gate::NoiseGate,
+    x::Float64
+)
+
+    level =
+        abs(x)
+
+
+    if level >
+       gate.envelope
+
+        gate.envelope +=
+            gate.attack *
+            (level - gate.envelope)
+
+    else
+
+        gate.envelope +=
+            gate.release *
+            (level - gate.envelope)
+
+    end
+
+
+    if gate.envelope <
+       gate.threshold
+
+        return x * 0.05
+
+    end
+
+
+    x
+
+end
+
+
+# ============================================================
+# RESONANCE NOTCH
+# ============================================================
+
+mutable struct ResonanceSuppressor
+
+    frequencies::Vector{Float64}
+
+    filters::Vector{Biquad}
+
+end
+
+
+function ResonanceSuppressor()
+
+    ResonanceSuppressor(
+
+        Float64[],
+
+        Biquad[]
+    )
+
+end
+
+
+function add_resonance!(
+    r::ResonanceSuppressor,
+    frequency::Float64
+)
+
+    filter =
+        Biquad()
+
+
+    peaking!(
+        filter,
+        frequency,
+        -6.0,
+        4.0,
+        SAMPLE_RATE
+    )
+
+
+    push!(
+        r.frequencies,
+        frequency
+    )
+
+
+    push!(
+        r.filters,
+        filter
+    )
+
+end
+
+
+function process!(
+    r::ResonanceSuppressor,
+    x::Float64
+)
+
+    for f in r.filters
+
+        x =
+            process!(
+                f,
+                x
+            )
+
+    end
+
+
+    x
+
+end
+
+
+# ============================================================
+# CABINET SIMULATOR
+# ============================================================
+
+mutable struct CabinetSimulator
+
+    lowpass::Biquad
+
+end
+
+
+function CabinetSimulator()
+
+    filter =
+        Biquad()
+
+
+    lowpass!(
+        filter,
+        5500.0,
+        SAMPLE_RATE
+    )
+
+
+    CabinetSimulator(
+        filter
+    )
+
+end
+
+
+function process!(
+    cabinet::CabinetSimulator,
+    x::Float64
+)
+
+    process!(
+        cabinet.lowpass,
+        x
+    )
+
+end
+
+
+# ============================================================
+# ROOM COMPENSATION
+# ============================================================
+
+mutable struct RoomCompensation
+
+    low::Biquad
+    presence::Biquad
+    high::Biquad
+
+end
+
+
+function RoomCompensation()
+
+    low =
+        Biquad()
+
+
+    presence =
+        Biquad()
+
+
+    high =
+        Biquad()
+
+
+    peaking!(
+        low,
+        100.0,
+        -1.5,
+        0.7,
+        SAMPLE_RATE
+    )
+
+
+    peaking!(
+        presence,
+        1800.0,
+        1.0,
+        0.8,
+        SAMPLE_RATE
+    )
+
+
+    peaking!(
+        high,
+        5000.0,
+        -1.5,
+        0.8,
+        SAMPLE_RATE
+    )
+
+
+    RoomCompensation(
+        low,
+        presence,
+        high
+    )
+
+end
+
+
+function process!(
+    room::RoomCompensation,
+    x::Float64
+)
+
+    x =
+        process!(
+            room.low,
+            x
+        )
+
+
+    x =
+        process!(
+            room.presence,
+            x
+        )
+
+
+    x =
+        process!(
+            room.high,
+            x
+        )
+
+
+    x
+
+end
+
+
+# ============================================================
+# COMPRESSOR
+# ============================================================
+
+mutable struct Compressor
+
+    threshold::Float64
+
+    ratio::Float64
+
+    envelope::Float64
+
+    attack::Float64
+    release::Float64
+
+end
+
+
+function Compressor()
+
+    Compressor(
+
+        db_to_gain(-12.0),
+
+        3.0,
+
+        0.0,
+
+        0.01,
+        0.001
+    )
+
+end
+
+
+function process!(
+    c::Compressor,
+    x::Float64
+)
+
+    level =
+        abs(x)
+
+
+    if level >
+       c.envelope
+
+        c.envelope +=
+            c.attack *
+            (level - c.envelope)
+
+    else
+
+        c.envelope +=
+            c.release *
+            (level - c.envelope)
+
+    end
+
+
+    if c.envelope <=
+       c.threshold
+
+        return x
+    end
+
+
+    excess =
+        c.envelope /
+        c.threshold
+
+
+    reduction =
+        excess^(
+            -(1.0 - 1.0 / c.ratio)
+        )
+
+
+    x * reduction
+
+end
+
+
+# ============================================================
+# LIMITER
+# ============================================================
+
+mutable struct Limiter
+
+    ceiling::Float64
+
+end
+
+
+Limiter() =
+    Limiter(
+        db_to_gain(-1.0)
+    )
+
+
+function process!(
+    limiter::Limiter,
+    x::Float64
+)
+
+    clamp(
+        x,
+        -limiter.ceiling,
+        limiter.ceiling
+    )
+
+end
+
+
+# ============================================================
+# POWER AMP
+# ============================================================
+
+mutable struct PowerAmp
+
+    gain::Float64
+
+end
+
+
+PowerAmp() =
+    PowerAmp(
+        1.0
+    )
+
+
+function process!(
+    amp::PowerAmp,
+    x::Float64
+)
+
+    tanh(
+        x *
+        amp.gain
+    )
+
+end
+
+
+# ============================================================
+# AMPLIFIER CONFIGURATION
+# ============================================================
+
+struct AmpConfiguration
+
+    input_gain::Float64
+
+    bass::Float64
+    middle::Float64
+    treble::Float64
+
+    drive::Float64
+
+    master::Float64
+
+end
+
+
+AmpConfiguration() =
+    AmpConfiguration(
+
+        2.0,
+
+        0.5,
+        0.5,
+        0.5,
+
+        0.25,
+
+        0.5
+    )
+
+
+# ============================================================
+# COMPLETE AMPLIFIER
+# ============================================================
+
+mutable struct GuitarAmplifier
+
+    configuration::AmpConfiguration
+
+    gate::NoiseGate
+
+    preamp::Preamp
+
+    tone::ToneStack
+
+    resonance::ResonanceSuppressor
+
+    cabinet::CabinetSimulator
+
+    room::RoomCompensation
+
+    compressor::Compressor
+
+    limiter::Limiter
+
+    power_amp::PowerAmp
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function GuitarAmplifier(
+    configuration =
+        AmpConfiguration()
+)
+
+    preamp =
+        Preamp()
+
+
+    preamp.gain =
+        configuration.input_gain
+
+
+    preamp.drive =
+        configuration.drive
+
+
+    tone =
+        ToneStack()
+
+
+    tone.bass =
+        configuration.bass
+
+    tone.middle =
+        configuration.middle
+
+    tone.treble =
+        configuration.treble
+
+
+    configure!(
+        tone
+    )
+
+
+    resonance =
+        ResonanceSuppressor()
+
+
+    # Typical problematic room / cabinet resonances.
+
+    add_resonance!(
+        resonance,
+        120.0
+    )
+
+
+    add_resonance!(
+        resonance,
+        240.0
+    )
+
+
+    add_resonance!(
+        resonance,
+        3200.0
+    )
+
+
+    GuitarAmplifier(
+
+        configuration,
+
+        NoiseGate(),
+
+        preamp,
+
+        tone,
+
+        resonance,
+
+        CabinetSimulator(),
+
+        RoomCompensation(),
+
+        Compressor(),
+
+        Limiter(),
+
+        PowerAmp()
+    )
+
+end
+
+
+# ============================================================
+# SIGNAL PROCESSING
+# ============================================================
+
+function process_sample!(
+    amp::GuitarAmplifier,
+    x::Float64
+)
+
+    # INPUT
+    x =
+        clamp_sample(x)
+
+
+    # NOISE GATE
+    x =
+        process!(
+            amp.gate,
+            x
+        )
+
+
+    # PREAMP
+    x =
+        process!(
+            amp.preamp,
+            x
+        )
+
+
+    # TONE STACK
+    x =
+        process!(
+            amp.tone,
+            x
+        )
+
+
+    # RESONANCE CONTROL
+    x =
+        process!(
+            amp.resonance,
+            x
+        )
+
+
+    # CABINET
+    x =
+        process!(
+            amp.cabinet,
+            x
+        )
+
+
+    # ROOM
+    x =
+        process!(
+            amp.room,
+            x
+        )
+
+
+    # DYNAMIC CONTROL
+    x =
+        process!(
+            amp.compressor,
+            x
+        )
+
+
+    # POWER AMP
+    x =
+        process!(
+            amp.power_amp,
+            x
+        )
+
+
+    # MASTER
+    x *=
+        amp.configuration.master
+
+
+    # SAFETY LIMITER
+    x =
+        process!(
+            amp.limiter,
+            x
+        )
+
+
+    clamp_sample(x)
+
+end
+
+
+# ============================================================
+# BUFFER PROCESSING
+# ============================================================
+
+function process!(
+    amp::GuitarAmplifier,
+    input::Vector{Float64}
+)
+
+    output =
+        similar(input)
+
+
+    @inbounds for i in eachindex(input)
+
+        output[i] =
+            process_sample!(
+                amp,
+                input[i]
+            )
+
+    end
+
+
+    output
+
+end
+
+
+# ============================================================
+# ACOUSTIC ANALYSIS
+# ============================================================
+
+struct AcousticMetrics
+
+    rms::Float64
+
+    peak::Float64
+
+    crest_factor::Float64
+
+    zero_crossing_rate::Float64
+
+end
+
+
+function analyse(
+    signal::Vector{Float64}
+)
+
+    isempty(signal) &&
+        return AcousticMetrics(
+            0.0,
+            0.0,
+            0.0,
+            0.0
+        )
+
+
+    rms =
+        sqrt(
+            mean(
+                signal .^ 2
+            )
+        )
+
+
+    peak =
+        maximum(
+            abs,
+            signal
+        )
+
+
+    crest =
+        rms > 0 ?
+        peak / rms :
+        0.0
+
+
+    crossings =
+        0
+
+
+    for i in 2:length(signal)
+
+        if signbit(signal[i]) !=
+           signbit(signal[i-1])
+
+            crossings += 1
+
+        end
+
+    end
+
+
+    zcr =
+        crossings /
+        max(
+            length(signal) - 1,
+            1
+        )
+
+
+    AcousticMetrics(
+
+        rms,
+
+        peak,
+
+        crest,
+
+        zcr
+    )
+
+end
+
+
+# ============================================================
+# AUTOMATIC GAIN OPTIMISATION
+# ============================================================
+
+function optimise_input_gain!(
+    amp::GuitarAmplifier,
+    signal::Vector{Float64}
+)
+
+    metrics =
+        analyse(signal)
+
+
+    if metrics.peak > 0.95
+
+        amp.preamp.gain *=
+            0.90
+
+    elseif metrics.peak < 0.30
+
+        amp.preamp.gain *=
+            1.05
+
+    end
+
+
+    amp.preamp.gain =
+        clamp(
+            amp.preamp.gain,
+            0.25,
+            8.0
+        )
+
+
+    amp.preamp.gain
+
+end
+
+
+# ============================================================
+# AUTOMATIC ROOM OPTIMISATION
+# ============================================================
+
+function room_scan(
+    signal::Vector{Float64}
+)
+
+    metrics =
+        analyse(signal)
+
+
+    recommendations =
+        Dict{Symbol,Float64}()
+
+
+    # High crest factor can indicate transient-heavy signal.
+
+    if metrics.crest_factor > 5.0
+
+        recommendations[
+            :compression
+        ] = 1.0
+    end
+
+
+    # Excessive zero-crossing activity can indicate
+    # high-frequency content.
+
+    if metrics.zero_crossing_rate > 0.15
+
+        recommendations[
+            :treble_reduction
+        ] = -1.0
+    end
+
+
+    recommendations
+
+end
+
+
+# ============================================================
+# PRESET SYSTEM
+# ============================================================
+
+@enum AmpPreset begin
+
+    CLEAN
+
+    BLUES
+
+    ROCK
+
+    HIGH_GAIN
+
+    JAZZ
+
+    ACOUSTIC
+
+end
+
+
+function preset(
+    p::AmpPreset
+)
+
+    if p == CLEAN
+
+        return AmpConfiguration(
+            1.5,
+            0.55,
+            0.55,
+            0.65,
+            0.05,
+            0.5
+        )
+
+
+    elseif p == BLUES
+
+        return AmpConfiguration(
+            2.5,
+            0.60,
+            0.55,
+            0.55,
+            0.35,
+            0.5
+        )
+
+
+    elseif p == ROCK
+
+        return AmpConfiguration(
+            3.0,
+            0.65,
+            0.60,
+            0.65,
+            0.55,
+            0.5
+        )
+
+
+    elseif p == HIGH_GAIN
+
+        return AmpConfiguration(
+            4.5,
+            0.60,
+            0.50,
+            0.70,
+            0.85,
+            0.4
+        )
+
+
+    elseif p == JAZZ
+
+        return AmpConfiguration(
+            1.2,
+            0.45,
+            0.65,
+            0.45,
+            0.0,
+            0.5
+        )
+
+
+    elseif p == ACOUSTIC
+
+        return AmpConfiguration(
+            1.3,
+            0.45,
+            0.60,
+            0.65,
+            0.0,
+            0.5
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# APPLY PRESET
+# ============================================================
+
+function apply_preset!(
+    amp::GuitarAmplifier,
+    p::AmpPreset
+)
+
+    configuration =
+        preset(p)
+
+
+    amp.configuration =
+        configuration
+
+
+    amp.preamp.gain =
+        configuration.input_gain
+
+
+    amp.preamp.drive =
+        configuration.drive
+
+
+    amp.tone.bass =
+        configuration.bass
+
+
+    amp.tone.middle =
+        configuration.middle
+
+
+    amp.tone.treble =
+        configuration.treble
+
+
+    amp.configuration =
+        configuration
+
+
+    configure!(
+        amp.tone
+    )
+
+
+    amp
+
+end
+
+
+# ============================================================
+# ACOUSTIC ENVIRONMENT PROFILE
+# ============================================================
+
+struct RoomProfile
+
+    name::String
+
+    low_frequency_factor::Float64
+
+    mid_frequency_factor::Float64
+
+    high_frequency_factor::Float64
+
+end
+
+
+const SMALL_ROOM =
+    RoomProfile(
+        "Small Room",
+        0.90,
+        1.00,
+        0.92
+    )
+
+
+const LARGE_ROOM =
+    RoomProfile(
+        "Large Room",
+        1.08,
+        0.98,
+        1.02
+    )
+
+
+const LIVE_STAGE =
+    RoomProfile(
+        "Live Stage",
+        1.05,
+        1.05,
+        1.08
+    )
+
+
+# ============================================================
+# ROOM PROFILE APPLICATION
+# ============================================================
+
+function apply_room!(
+    amp::GuitarAmplifier,
+    room::RoomProfile
+)
+
+    peaking!(
+        amp.room.low,
+        120.0,
+        10.0 *
+        log10(room.low_frequency_factor),
+        0.7,
+        SAMPLE_RATE
+    )
+
+
+    peaking!(
+        amp.room.presence,
+        1800.0,
+        10.0 *
+        log10(room.mid_frequency_factor),
+        0.8,
+        SAMPLE_RATE
+    )
+
+
+    peaking!(
+        amp.room.high,
+        5000.0,
+        10.0 *
+        log10(room.high_frequency_factor),
+        0.8,
+        SAMPLE_RATE
+    )
+
+
+    amp
+
+end
+
+
+# ============================================================
+# SYSTEM STATUS
+# ============================================================
+
+function status(
+    amp::GuitarAmplifier
+)
+
+    c =
+        amp.configuration
+
+
+    println()
+    println("==============================================")
+    println("              GUITARAMP.OS")
+    println("==============================================")
+
+    println()
+
+    println(
+        "INPUT GAIN : ",
+        round(c.input_gain, digits=2)
+    )
+
+    println(
+        "BASS       : ",
+        round(c.bass, digits=2)
+    )
+
+    println(
+        "MIDDLE     : ",
+        round(c.middle, digits=2)
+    )
+
+    println(
+        "TREBLE     : ",
+        round(c.treble, digits=2)
+    )
+
+    println(
+        "DRIVE      : ",
+        round(c.drive, digits=2)
+    )
+
+    println(
+        "MASTER     : ",
+        round(c.master, digits=2)
+    )
+
+    println()
+
+    println(
+        "RESONANCES : ",
+        length(
+            amp.resonance.frequencies
+        )
+    )
+
+    println(
+        "SAMPLE RATE: ",
+        SAMPLE_RATE,
+        " Hz"
+    )
+
+    println("==============================================")
+    println()
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    amp =
+        GuitarAmplifier()
+
+
+    # Start with clean tone.
+
+    apply_preset!(
+        amp,
+        CLEAN
+    )
+
+
+    apply_room!(
+        amp,
+        SMALL_ROOM
+    )
+
+
+    status(amp)
+
+
+    # Generate a simple test guitar-like signal.
+
+    duration =
+        0.5
+
+
+    n =
+        Int(
+            SAMPLE_RATE *
+            duration
+        )
+
+
+    input =
+        Vector{Float64}(
+            undef,
+            n
+        )
+
+
+    for i in 1:n
+
+        t =
+            (i - 1) /
+            SAMPLE_RATE
+
+
+        # Fundamental + harmonics.
+
+        input[i] =
+
+            0.60 *
+            sin(
+                PI2 *
+                110.0 *
+                t
+            )
+
+            +
+
+            0.20 *
+            sin(
+                PI2 *
+                220.0 *
+                t
+            )
+
+            +
+
+            0.10 *
+            sin(
+                PI2 *
+                330.0 *
+                t
+            )
+
+    end
+
+
+    # Analyse guitar input.
+
+    before =
+        analyse(input)
+
+
+    println(
+        "INPUT RMS  : ",
+        round(
+            before.rms,
+            digits=4
+        )
+    )
+
+
+    println(
+        "INPUT PEAK : ",
+        round(
+            before.peak,
+            digits=4
+        )
+    )
+
+
+    # Optimise gain.
+
+    optimise_input_gain!(
+        amp,
+        input
+    )
+
+
+    # Process.
+
+    output =
+        process!(
+            amp,
+            input
+        )
+
+
+    after =
+        analyse(output)
+
+
+    println(
+        "OUTPUT RMS : ",
+        round(
+            after.rms,
+            digits=4
+        )
+    )
+
+
+    println(
+        "OUTPUT PEAK: ",
+        round(
+            after.peak,
+            digits=4
+        )
+    )
+
+
+    println()
+
+    println(
+        "Room analysis:"
+    )
+
+
+    println(
+        room_scan(output)
+    )
+
+
+    output
+
+end
+
+
+end # module
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+using .GuitarAmpOS
+
+GuitarAmpOS.demo()
