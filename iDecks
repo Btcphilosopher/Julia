@@ -1,0 +1,2425 @@
+module iDecksOS
+
+using LinearAlgebra
+using Statistics
+using Random
+
+# ============================================================
+# iDECKS.OS
+#
+# APPLE-STYLE PROFESSIONAL DJ CONTROLLER ENGINE
+#
+# Pure Julia
+#
+# Architecture
+#
+#       CONTROLLER HARDWARE
+#               │
+#       ┌───────┴────────┐
+#       │                │
+#    DECK A            DECK B
+#       │                │
+#   ┌───┴───┐        ┌───┴───┐
+#   │       │        │       │
+# JOG    MIXER     JOG     MIXER
+#   │       │        │       │
+#   └───┬───┘        └───┬───┘
+#       │                │
+#       └──────┬─────────┘
+#              │
+#        AUDIO ENGINE
+#              │
+#        MASTER OUTPUT
+#
+# ============================================================
+
+
+# ============================================================
+# VERSION
+# ============================================================
+
+const IDECKS_VERSION = v"1.0.0"
+
+
+# ============================================================
+# BASIC TYPES
+# ============================================================
+
+const Sample = Float32
+const StereoSample = NTuple{2,Sample}
+
+
+# ============================================================
+# DECK STATES
+# ============================================================
+
+@enum DeckState begin
+    DECK_STOPPED
+    DECK_CUED
+    DECK_PLAYING
+    DECK_PAUSED
+end
+
+
+@enum PlayDirection begin
+    FORWARD
+    REVERSE
+end
+
+
+@enum LoopState begin
+    LOOP_OFF
+    LOOP_ARMED
+    LOOP_ACTIVE
+end
+
+
+# ============================================================
+# DJ TRACK
+# ============================================================
+
+mutable struct Track
+
+    title::String
+    artist::String
+
+    bpm::Float64
+    duration_s::Float64
+
+    sample_rate::Int
+    channels::Int
+
+    samples::Vector{Sample}
+
+    beat_positions::Vector{Float64}
+
+end
+
+
+function Track(
+    title::String,
+    artist::String;
+    bpm::Real = 120.0,
+    duration_s::Real = 180.0,
+    sample_rate::Int = 48_000
+)
+
+    n =
+        Int(round(duration_s * sample_rate * 2))
+
+    Track(
+        title,
+        artist,
+        Float64(bpm),
+        Float64(duration_s),
+        sample_rate,
+        2,
+        zeros(Sample,n),
+        Float64[]
+    )
+
+end
+
+
+# ============================================================
+# LOAD SYNTHETIC TRACK
+#
+# Useful for testing the engine without external audio I/O.
+# ============================================================
+
+function generate_test_track(
+    title;
+    bpm = 128.0,
+    duration_s = 60.0,
+    sample_rate = 48_000
+)
+
+    track =
+        Track(
+            title,
+            "iDecks Test Artist";
+            bpm=bpm,
+            duration_s=duration_s,
+            sample_rate=sample_rate
+        )
+
+    nframes =
+        Int(round(duration_s * sample_rate))
+
+    resize!(
+        track.samples,
+        nframes * 2
+    )
+
+    for i in 1:nframes
+
+        t = (i - 1) / sample_rate
+
+        beat =
+            sin(2π * bpm / 60 * t)
+
+        bass =
+            0.25 *
+            sin(2π * 55 * t)
+
+        sample =
+            Sample(
+                0.15 * beat +
+                bass
+            )
+
+        track.samples[2i-1] = sample
+        track.samples[2i] = sample
+
+    end
+
+    generate_beatgrid!(track)
+
+    track
+
+end
+
+
+# ============================================================
+# BEAT GRID
+# ============================================================
+
+function generate_beatgrid!(
+    track::Track
+)
+
+    empty!(
+        track.beat_positions
+    )
+
+    interval =
+        60.0 / track.bpm
+
+    t = 0.0
+
+    while t < track.duration_s
+
+        push!(
+            track.beat_positions,
+            t
+        )
+
+        t += interval
+
+    end
+
+    track
+
+end
+
+
+# ============================================================
+# DECK POSITION
+# ============================================================
+
+mutable struct Position
+
+    seconds::Float64
+    sample::Int
+
+end
+
+
+Position() =
+    Position(0.0,1)
+
+
+# ============================================================
+# JOG WHEEL
+# ============================================================
+
+mutable struct JogWheel
+
+    position::Float64
+    velocity::Float64
+
+    touch::Bool
+
+    sensitivity::Float64
+
+    pitch_bend::Float64
+
+end
+
+
+function JogWheel()
+
+    JogWheel(
+        0.0,
+        0.0,
+        false,
+        1.0,
+        0.0
+    )
+
+end
+
+
+function rotate!(
+    jog::JogWheel,
+    delta::Real
+)
+
+    jog.velocity =
+        Float64(delta) *
+        jog.sensitivity
+
+    jog.position +=
+        jog.velocity
+
+    jog.pitch_bend =
+        clamp(
+            jog.velocity * 0.02,
+            -1.0,
+            1.0
+        )
+
+end
+
+
+function touch!(
+    jog::JogWheel,
+    active::Bool
+)
+
+    jog.touch = active
+
+end
+
+
+# ============================================================
+# TEMPO CONTROL
+# ============================================================
+
+mutable struct TempoControl
+
+    bpm::Float64
+
+    pitch_percent::Float64
+
+    master_tempo::Bool
+
+end
+
+
+function TempoControl(bpm=120.0)
+
+    TempoControl(
+        Float64(bpm),
+        0.0,
+        true
+    )
+
+end
+
+
+function playback_ratio(
+    tempo::TempoControl
+)
+
+    1.0 +
+    tempo.pitch_percent / 100.0
+
+end
+
+
+# ============================================================
+# LOOP ENGINE
+# ============================================================
+
+mutable struct LoopEngine
+
+    state::LoopState
+
+    start_s::Float64
+    end_s::Float64
+
+    beats::Int
+
+end
+
+
+function LoopEngine()
+
+    LoopEngine(
+        LOOP_OFF,
+        0.0,
+        0.0,
+        0
+    )
+
+end
+
+
+function set_loop!(
+    loop::LoopEngine,
+    current_s::Real,
+    beats::Int,
+    bpm::Real
+)
+
+    interval =
+        60.0 / Float64(bpm)
+
+    length_s =
+        interval * beats
+
+    loop.start_s =
+        Float64(current_s)
+
+    loop.end_s =
+        Float64(current_s) +
+        length_s
+
+    loop.beats = beats
+
+    loop.state =
+        LOOP_ARMED
+
+end
+
+
+function activate_loop!(
+    loop::LoopEngine
+)
+
+    if loop.end_s > loop.start_s
+
+        loop.state =
+            LOOP_ACTIVE
+
+    end
+
+end
+
+
+function disable_loop!(
+    loop::LoopEngine
+)
+
+    loop.state =
+        LOOP_OFF
+
+end
+
+
+function loop_position!(
+    loop::LoopEngine,
+    position::Float64
+)
+
+    if loop.state == LOOP_ACTIVE
+
+        if position >= loop.end_s
+
+            return loop.start_s
+
+        end
+
+    end
+
+    position
+
+end
+
+
+# ============================================================
+# HOT CUE
+# ============================================================
+
+mutable struct HotCueBank
+
+    cues::Vector{Union{Nothing,Float64}}
+
+end
+
+
+function HotCueBank(n=8)
+
+    HotCueBank(
+        Vector{Union{Nothing,Float64}}(
+            fill(nothing,n)
+        )
+    )
+
+end
+
+
+function set_cue!(
+    bank::HotCueBank,
+    index::Int,
+    position::Real
+)
+
+    1 <= index <= length(bank.cues) ||
+        throw(BoundsError())
+
+    bank.cues[index] =
+        Float64(position)
+
+end
+
+
+function clear_cue!(
+    bank::HotCueBank,
+    index::Int
+)
+
+    bank.cues[index] =
+        nothing
+
+end
+
+
+function jump_to_cue!(
+    bank::HotCueBank,
+    index::Int
+)
+
+    cue =
+        bank.cues[index]
+
+    cue === nothing ?
+        nothing :
+        cue
+
+end
+
+
+# ============================================================
+# CUE / HEADPHONE SYSTEM
+# ============================================================
+
+mutable struct CueSystem
+
+    deck_a::Bool
+    deck_b::Bool
+
+    master::Bool
+
+    cue_mix::Float64
+
+    cue_volume::Float64
+
+end
+
+
+function CueSystem()
+
+    CueSystem(
+        false,
+        false,
+        false,
+        0.5,
+        1.0
+    )
+
+end
+
+
+# ============================================================
+# THREE-BAND EQ
+# ============================================================
+
+mutable struct Equalizer
+
+    low_db::Float64
+    mid_db::Float64
+    high_db::Float64
+
+end
+
+
+function Equalizer()
+
+    Equalizer(
+        0.0,
+        0.0,
+        0.0
+    )
+
+end
+
+
+function reset!(
+    eq::Equalizer
+)
+
+    eq.low_db = 0.0
+    eq.mid_db = 0.0
+    eq.high_db = 0.0
+
+end
+
+
+# ============================================================
+# FILTER
+# ============================================================
+
+mutable struct Filter
+
+    cutoff::Float64
+    resonance::Float64
+
+end
+
+
+function Filter()
+
+    Filter(
+        1.0,
+        0.0
+    )
+
+end
+
+
+function set_cutoff!(
+    filter::Filter,
+    value::Real
+)
+
+    filter.cutoff =
+        clamp(
+            Float64(value),
+            0.0,
+            1.0
+        )
+
+end
+
+
+# ============================================================
+# EFFECTS
+# ============================================================
+
+@enum EffectType begin
+    EFFECT_NONE
+    EFFECT_FILTER
+    EFFECT_ECHO
+    EFFECT_REVERB
+    EFFECT_DELAY
+    EFFECT_FLANGER
+end
+
+
+mutable struct Effect
+
+    kind::EffectType
+
+    enabled::Bool
+
+    mix::Float64
+    parameter::Float64
+
+end
+
+
+function Effect()
+
+    Effect(
+        EFFECT_NONE,
+        false,
+        0.0,
+        0.0
+    )
+
+end
+
+
+function set_effect!(
+    effect::Effect,
+    kind::EffectType
+)
+
+    effect.kind =
+        kind
+
+    effect.enabled =
+        kind != EFFECT_NONE
+
+end
+
+
+# ============================================================
+# CHANNEL STRIP
+# ============================================================
+
+mutable struct ChannelStrip
+
+    gain::Float64
+
+    eq::Equalizer
+
+    filter::Filter
+
+    effect::Effect
+
+    volume::Float64
+
+    cue::Bool
+
+end
+
+
+function ChannelStrip()
+
+    ChannelStrip(
+        1.0,
+        Equalizer(),
+        Filter(),
+        Effect(),
+        1.0,
+        false
+    )
+
+end
+
+
+# ============================================================
+# CROSSFADER
+# ============================================================
+
+mutable struct Crossfader
+
+    position::Float64
+
+    curve::Float64
+
+end
+
+
+function Crossfader()
+
+    Crossfader(
+        0.5,
+        1.0
+    )
+
+end
+
+
+function set_crossfader!(
+    fader::Crossfader,
+    position::Real
+)
+
+    fader.position =
+        clamp(
+            Float64(position),
+            0.0,
+            1.0
+        )
+
+end
+
+
+function gains(
+    fader::Crossfader
+)
+
+    x =
+        fader.position
+
+    angle =
+        x * π / 2
+
+    left =
+        cos(angle)
+
+    right =
+        sin(angle)
+
+    left,right
+
+end
+
+
+# ============================================================
+# DECK
+# ============================================================
+
+mutable struct Deck
+
+    id::Symbol
+
+    track::Union{Nothing,Track}
+
+    state::DeckState
+
+    direction::PlayDirection
+
+    position::Position
+
+    jog::JogWheel
+
+    tempo::TempoControl
+
+    loop::LoopEngine
+
+    cues::HotCueBank
+
+    channel::ChannelStrip
+
+    pitch_range::Float64
+
+end
+
+
+function Deck(
+    id::Symbol
+)
+
+    Deck(
+        id,
+        nothing,
+        DECK_STOPPED,
+        FORWARD,
+        Position(),
+        JogWheel(),
+        TempoControl(),
+        LoopEngine(),
+        HotCueBank(),
+        ChannelStrip(),
+        8.0
+    )
+
+end
+
+
+# ============================================================
+# LOAD TRACK
+# ============================================================
+
+function load_track!(
+    deck::Deck,
+    track::Track
+)
+
+    deck.track =
+        track
+
+    deck.position =
+        Position()
+
+    deck.state =
+        DECK_CUED
+
+    deck.direction =
+        FORWARD
+
+    deck.tempo.bpm =
+        track.bpm
+
+    deck.loop =
+        LoopEngine()
+
+    deck.cues =
+        HotCueBank()
+
+    deck
+
+end
+
+
+# ============================================================
+# PLAY
+# ============================================================
+
+function play!(
+    deck::Deck
+)
+
+    deck.track === nothing &&
+        return false
+
+    deck.state =
+        DECK_PLAYING
+
+    true
+
+end
+
+
+# ============================================================
+# PAUSE
+# ============================================================
+
+function pause!(
+    deck::Deck
+)
+
+    deck.state =
+        DECK_PAUSED
+
+end
+
+
+# ============================================================
+# STOP
+# ============================================================
+
+function stop!(
+    deck::Deck
+)
+
+    deck.state =
+        DECK_STOPPED
+
+    deck.position =
+        Position()
+
+end
+
+
+# ============================================================
+# CUE
+# ============================================================
+
+function cue!(
+    deck::Deck
+)
+
+    deck.position =
+        Position()
+
+    deck.state =
+        DECK_CUED
+
+end
+
+
+# ============================================================
+# PITCH CONTROL
+# ============================================================
+
+function set_pitch!(
+    deck::Deck,
+    percent::Real
+)
+
+    deck.tempo.pitch_percent =
+        clamp(
+            Float64(percent),
+            -deck.pitch_range,
+            deck.pitch_range
+        )
+
+end
+
+
+# ============================================================
+# TEMPO SYNC
+# ============================================================
+
+function sync!(
+    source::Deck,
+    target::Deck
+)
+
+    source.track === nothing &&
+        return false
+
+    target.track === nothing &&
+        return false
+
+    target.tempo.bpm =
+        source.tempo.bpm
+
+    true
+
+end
+
+
+# ============================================================
+# BEAT POSITION
+# ============================================================
+
+function current_beat(
+    deck::Deck
+)
+
+    deck.track === nothing &&
+        return 0
+
+    bpm =
+        deck.tempo.bpm
+
+    deck.position.seconds *
+        bpm / 60.0
+
+end
+
+
+# ============================================================
+# ADVANCE DECK
+# ============================================================
+
+function advance!(
+    deck::Deck,
+    dt::Real
+)
+
+    deck.state != DECK_PLAYING &&
+        return
+
+    track =
+        deck.track
+
+    track === nothing &&
+        return
+
+    ratio =
+        deck.tempo.bpm /
+        track.bpm
+
+    delta =
+        Float64(dt) * ratio
+
+    if deck.direction == FORWARD
+
+        newpos =
+            deck.position.seconds +
+            delta
+
+    else
+
+        newpos =
+            deck.position.seconds -
+            delta
+
+    end
+
+    if deck.loop.state == LOOP_ACTIVE
+
+        if newpos >= deck.loop.end_s
+
+            newpos =
+                deck.loop.start_s
+
+        end
+
+    end
+
+    if newpos >= track.duration_s
+
+        newpos =
+            0.0
+
+        deck.state =
+            DECK_CUED
+
+    elseif newpos < 0
+
+        newpos =
+            0.0
+
+        deck.state =
+            DECK_CUED
+
+    end
+
+    deck.position.seconds =
+        newpos
+
+end
+
+
+# ============================================================
+# SEEK
+# ============================================================
+
+function seek!(
+    deck::Deck,
+    seconds::Real
+)
+
+    deck.track === nothing &&
+        return false
+
+    deck.position.seconds =
+        clamp(
+            Float64(seconds),
+            0.0,
+            deck.track.duration_s
+        )
+
+    true
+
+end
+
+
+# ============================================================
+# SCRATCH
+# ============================================================
+
+function scratch!(
+    deck::Deck,
+    delta::Real
+)
+
+    deck.jog.touch ||
+        return false
+
+    seek!(
+        deck,
+        deck.position.seconds -
+        Float64(delta) * 0.02
+    )
+
+    true
+
+end
+
+
+# ============================================================
+# MASTER CLOCK
+# ============================================================
+
+mutable struct MasterClock
+
+    bpm::Float64
+
+    beat::Float64
+
+    running::Bool
+
+end
+
+
+function MasterClock()
+
+    MasterClock(
+        120.0,
+        0.0,
+        false
+    )
+
+end
+
+
+function update_clock!(
+    clock::MasterClock,
+    dt::Real
+)
+
+    clock.running ||
+        return
+
+    clock.beat +=
+        Float64(dt) *
+        clock.bpm /
+        60.0
+
+end
+
+
+# ============================================================
+# MASTER MIXER
+# ============================================================
+
+mutable struct MasterMixer
+
+    deck_a_gain::Float64
+    deck_b_gain::Float64
+
+    master_gain::Float64
+
+    crossfader::Crossfader
+
+    limiter_threshold::Float64
+
+end
+
+
+function MasterMixer()
+
+    MasterMixer(
+        1.0,
+        1.0,
+        1.0,
+        Crossfader(),
+        0.95
+    )
+
+end
+
+
+# ============================================================
+# MIX GAIN
+# ============================================================
+
+function mix_gains(
+    mixer::MasterMixer
+)
+
+    left,right =
+        gains(
+            mixer.crossfader
+        )
+
+    (
+        mixer.deck_a_gain * left,
+        mixer.deck_b_gain * right
+    )
+
+end
+
+
+# ============================================================
+# SIMPLE SOFT LIMITER
+# ============================================================
+
+function soft_limit(
+    x::Real,
+    threshold::Real = 0.95
+)
+
+    y =
+        Float64(x)
+
+    abs(y) <= threshold &&
+        return Sample(y)
+
+    sign(y) *
+        Sample(
+            threshold +
+            (1.0 - threshold) *
+            tanh(
+                (abs(y)-threshold) /
+                (1.0-threshold)
+            )
+        )
+
+end
+
+
+# ============================================================
+# AUDIO BUFFER
+# ============================================================
+
+mutable struct AudioBuffer
+
+    data::Matrix{Sample}
+
+    sample_rate::Int
+
+end
+
+
+function AudioBuffer(
+    frames::Int;
+    sample_rate=48_000
+)
+
+    AudioBuffer(
+        zeros(Sample,2,frames),
+        sample_rate
+    )
+
+end
+
+
+function clear!(
+    buffer::AudioBuffer
+)
+
+    fill!(
+        buffer.data,
+        Sample(0)
+    )
+
+end
+
+
+# ============================================================
+# READ DECK SAMPLE
+# ============================================================
+
+function deck_sample(
+    deck::Deck
+)
+
+    track =
+        deck.track
+
+    track === nothing &&
+        return (Sample(0),Sample(0))
+
+    frame =
+        clamp(
+            Int(floor(
+                deck.position.seconds *
+                track.sample_rate
+            )) + 1,
+            1,
+            length(track.samples) ÷ 2
+        )
+
+    (
+        track.samples[2frame-1],
+        track.samples[2frame]
+    )
+
+end
+
+
+# ============================================================
+# MASTER AUDIO MIX
+# ============================================================
+
+function render_frame!(
+    mixer::MasterMixer,
+    deck_a::Deck,
+    deck_b::Deck
+)
+
+    a =
+        deck_sample(deck_a)
+
+    b =
+        deck_sample(deck_b)
+
+    gain_a,
+    gain_b =
+        mix_gains(mixer)
+
+    left =
+        (
+            a[1] * gain_a +
+            b[1] * gain_b
+        ) *
+        mixer.master_gain
+
+    right =
+        (
+            a[2] * gain_a +
+            b[2] * gain_b
+        ) *
+        mixer.master_gain
+
+    (
+        soft_limit(
+            left,
+            mixer.limiter_threshold
+        ),
+        soft_limit(
+            right,
+            mixer.limiter_threshold
+        )
+    )
+
+end
+
+
+# ============================================================
+# DJ CONTROLLER
+# ============================================================
+
+mutable struct iDecksController
+
+    deck_a::Deck
+    deck_b::Deck
+
+    mixer::MasterMixer
+
+    cue_system::CueSystem
+
+    clock::MasterClock
+
+    sample_rate::Int
+
+    running::Bool
+
+end
+
+
+function iDecksController(
+    ;
+    sample_rate=48_000
+)
+
+    iDecksController(
+        Deck(:A),
+        Deck(:B),
+        MasterMixer(),
+        CueSystem(),
+        MasterClock(),
+        sample_rate,
+        false
+    )
+
+end
+
+
+# ============================================================
+# MASTER PLAY
+# ============================================================
+
+function start!(
+    controller::iDecksController
+)
+
+    controller.running =
+        true
+
+    controller.clock.running =
+        true
+
+    controller
+
+end
+
+
+function stop!(
+    controller::iDecksController
+)
+
+    controller.running =
+        false
+
+    controller.clock.running =
+        false
+
+    stop!(controller.deck_a)
+    stop!(controller.deck_b)
+
+end
+
+
+# ============================================================
+# ENGINE UPDATE
+# ============================================================
+
+function update!(
+    controller::iDecksController,
+    dt::Real
+)
+
+    controller.running ||
+        return
+
+    advance!(
+        controller.deck_a,
+        dt
+    )
+
+    advance!(
+        controller.deck_b,
+        dt
+    )
+
+    update_clock!(
+        controller.clock,
+        dt
+    )
+
+end
+
+
+# ============================================================
+# BPM DETECTION
+# ============================================================
+
+function estimate_bpm(
+    samples::AbstractVector,
+    sample_rate::Int
+)
+
+    isempty(samples) &&
+        return 0.0
+
+    # Lightweight heuristic estimator.
+    #
+    # Production implementation can be replaced with
+    # FFT/autocorrelation/onset detection.
+
+    energy =
+        mean(
+            abs2,
+            Float64.(samples)
+        )
+
+    energy <= 1e-12 &&
+        return 0.0
+
+    120.0
+
+end
+
+
+# ============================================================
+# AUTOMATIC SYNC
+# ============================================================
+
+function beat_sync!(
+    controller::iDecksController
+)
+
+    a =
+        controller.deck_a
+
+    b =
+        controller.deck_b
+
+    a.track === nothing &&
+        return false
+
+    b.track === nothing &&
+        return false
+
+    b.tempo.bpm =
+        a.tempo.bpm
+
+    beat_a =
+        current_beat(a)
+
+    beat_b =
+        current_beat(b)
+
+    difference =
+        beat_a - beat_b
+
+    b.position.seconds +=
+        difference *
+        60.0 /
+        b.tempo.bpm
+
+    true
+
+end
+
+
+# ============================================================
+# LOOP QUANTISATION
+# ============================================================
+
+function quantised_loop!(
+    deck::Deck,
+    beats::Int
+)
+
+    deck.track === nothing &&
+        return false
+
+    beat =
+        current_beat(deck)
+
+    grid =
+        round(beat)
+
+    position =
+        grid *
+        60.0 /
+        deck.tempo.bpm
+
+    set_loop!(
+        deck.loop,
+        position,
+        beats,
+        deck.tempo.bpm
+    )
+
+    activate_loop!(
+        deck.loop
+    )
+
+    true
+
+end
+
+
+# ============================================================
+# PERFORMANCE PAD
+# ============================================================
+
+@enum PadMode begin
+    PAD_HOTCUE
+    PAD_LOOP
+    PAD_SAMPLER
+    PAD_EFFECT
+end
+
+
+mutable struct PerformancePad
+
+    mode::PadMode
+
+    active::Bool
+
+end
+
+
+mutable struct PerformanceBank
+
+    pads::Vector{PerformancePad}
+
+end
+
+
+function PerformanceBank(n=16)
+
+    PerformanceBank(
+        [
+            PerformancePad(
+                PAD_HOTCUE,
+                false
+            )
+            for _ in 1:n
+        ]
+    )
+
+end
+
+
+# ============================================================
+# SAMPLER
+# ============================================================
+
+mutable struct Sampler
+
+    buffers::Vector{Vector{Sample}}
+
+    playing::Vector{Bool}
+
+    volume::Float64
+
+end
+
+
+function Sampler(n=8)
+
+    Sampler(
+        [
+            Sample[]
+            for _ in 1:n
+        ],
+        fill(false,n),
+        1.0
+    )
+
+end
+
+
+function load_sample!(
+    sampler::Sampler,
+    index::Int,
+    data::Vector{Sample}
+)
+
+    sampler.buffers[index] =
+        copy(data)
+
+end
+
+
+function trigger_sample!(
+    sampler::Sampler,
+    index::Int
+)
+
+    sampler.playing[index] =
+        true
+
+end
+
+
+# ============================================================
+# SESSION / LIBRARY
+# ============================================================
+
+mutable struct TrackLibrary
+
+    tracks::Vector{Track}
+
+end
+
+
+TrackLibrary() =
+    TrackLibrary(Track[])
+
+
+function add_track!(
+    library::TrackLibrary,
+    track::Track
+)
+
+    push!(
+        library.tracks,
+        track
+    )
+
+    track
+
+end
+
+
+function search(
+    library::TrackLibrary,
+    query::AbstractString
+)
+
+    q =
+        lowercase(query)
+
+    [
+        track
+        for track in library.tracks
+        if occursin(
+            q,
+            lowercase(track.title)
+        ) ||
+        occursin(
+            q,
+            lowercase(track.artist)
+        )
+    ]
+
+end
+
+
+# ============================================================
+# SESSION RECORDER
+# ============================================================
+
+mutable struct SessionRecorder
+
+    recording::Bool
+
+    frames::Vector{StereoSample}
+
+end
+
+
+function SessionRecorder()
+
+    SessionRecorder(
+        false,
+        StereoSample[]
+    )
+
+end
+
+
+function start_recording!(
+    recorder::SessionRecorder
+)
+
+    empty!(
+        recorder.frames
+    )
+
+    recorder.recording =
+        true
+
+end
+
+
+function record!(
+    recorder::SessionRecorder,
+    frame::StereoSample
+)
+
+    recorder.recording ||
+        return
+
+    push!(
+        recorder.frames,
+        frame
+    )
+
+end
+
+
+function stop_recording!(
+    recorder::SessionRecorder
+)
+
+    recorder.recording =
+        false
+
+end
+
+
+# ============================================================
+# MIDI / HID ABSTRACTION
+# ============================================================
+
+abstract type ControllerEvent end
+
+
+struct ButtonEvent <: ControllerEvent
+
+    id::Symbol
+    pressed::Bool
+
+end
+
+
+struct EncoderEvent <: ControllerEvent
+
+    id::Symbol
+    delta::Float64
+
+end
+
+
+struct FaderEvent <: ControllerEvent
+
+    id::Symbol
+    value::Float64
+
+end
+
+
+# ============================================================
+# HARDWARE MAP
+# ============================================================
+
+mutable struct HardwareMap
+
+    mappings::Dict{Symbol,Symbol}
+
+end
+
+
+function HardwareMap()
+
+    HardwareMap(
+        Dict(
+            :PLAY_A => :deck_a_play,
+            :PLAY_B => :deck_b_play,
+            :CUE_A => :deck_a_cue,
+            :CUE_B => :deck_b_cue,
+            :CROSSFADER => :crossfader,
+            :JOG_A => :jog_a,
+            :JOG_B => :jog_b
+        )
+    )
+
+end
+
+
+# ============================================================
+# EVENT DISPATCH
+# ============================================================
+
+function handle!(
+    controller::iDecksController,
+    event::ButtonEvent
+)
+
+    if event.id == :PLAY_A &&
+       event.pressed
+
+        play!(
+            controller.deck_a
+        )
+
+    elseif event.id == :PLAY_B &&
+           event.pressed
+
+        play!(
+            controller.deck_b
+        )
+
+    elseif event.id == :CUE_A &&
+           event.pressed
+
+        cue!(
+            controller.deck_a
+        )
+
+    elseif event.id == :CUE_B &&
+           event.pressed
+
+        cue!(
+            controller.deck_b
+        )
+
+    elseif event.id == :SYNC &&
+           event.pressed
+
+        beat_sync!(
+            controller
+        )
+
+    end
+
+end
+
+
+function handle!(
+    controller::iDecksController,
+    event::FaderEvent
+)
+
+    if event.id == :CROSSFADER
+
+        set_crossfader!(
+            controller.mixer.crossfader,
+            event.value
+        )
+
+    elseif event.id == :TEMPO_A
+
+        set_pitch!(
+            controller.deck_a,
+            event.value
+        )
+
+    elseif event.id == :TEMPO_B
+
+        set_pitch!(
+            controller.deck_b,
+            event.value
+        )
+
+    end
+
+end
+
+
+function handle!(
+    controller::iDecksController,
+    event::EncoderEvent
+)
+
+    if event.id == :JOG_A
+
+        rotate!(
+            controller.deck_a.jog,
+            event.delta
+        )
+
+        scratch!(
+            controller.deck_a,
+            event.delta
+        )
+
+    elseif event.id == :JOG_B
+
+        rotate!(
+            controller.deck_b.jog,
+            event.delta
+        )
+
+        scratch!(
+            controller.deck_b,
+            event.delta
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function deck_status(
+    deck::Deck
+)
+
+    (
+        id = deck.id,
+        state = deck.state,
+        track =
+            deck.track === nothing ?
+            "EMPTY" :
+            deck.track.title,
+        position =
+            deck.position.seconds,
+        bpm =
+            deck.tempo.bpm,
+        pitch =
+            deck.tempo.pitch_percent,
+        loop =
+            deck.loop.state
+    )
+
+end
+
+
+function status(
+    controller::iDecksController
+)
+
+    (
+        version = IDECKS_VERSION,
+
+        running =
+            controller.running,
+
+        deck_a =
+            deck_status(
+                controller.deck_a
+            ),
+
+        deck_b =
+            deck_status(
+                controller.deck_b
+            ),
+
+        crossfader =
+            controller.mixer
+                .crossfader
+                .position,
+
+        master_bpm =
+            controller.clock.bpm
+    )
+
+end
+
+
+# ============================================================
+# AUTOMATION ENGINE
+# ============================================================
+
+mutable struct AutomationStep
+
+    time_s::Float64
+
+    action::Function
+
+end
+
+
+mutable struct AutomationEngine
+
+    steps::Vector{AutomationStep}
+
+    index::Int
+
+end
+
+
+function AutomationEngine()
+
+    AutomationEngine(
+        AutomationStep[],
+        1
+    )
+
+end
+
+
+function add_step!(
+    automation::AutomationEngine,
+    time_s::Real,
+    action::Function
+)
+
+    push!(
+        automation.steps,
+        AutomationStep(
+            Float64(time_s),
+            action
+        )
+    )
+
+end
+
+
+function update!(
+    automation::AutomationEngine,
+    controller::iDecksController,
+    time_s::Real
+)
+
+    while automation.index <=
+          length(automation.steps)
+
+        step =
+            automation.steps[
+                automation.index
+            ]
+
+        if time_s >= step.time_s
+
+            step.action(
+                controller
+            )
+
+            automation.index += 1
+
+        else
+
+            break
+
+        end
+
+    end
+
+end
+
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+function diagnostics(
+    controller::iDecksController
+)
+
+    warnings =
+        String[]
+
+    for deck in (
+        controller.deck_a,
+        controller.deck_b
+    )
+
+        if deck.track === nothing
+
+            push!(
+                warnings,
+                "Deck $(deck.id) has no track"
+            )
+
+        end
+
+        if deck.tempo.bpm <= 0
+
+            push!(
+                warnings,
+                "Deck $(deck.id) has invalid BPM"
+            )
+
+        end
+
+    end
+
+    warnings
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    println(
+        "iDecks.OS ",
+        IDECKS_VERSION
+    )
+
+    controller =
+        iDecksController()
+
+
+    # --------------------------------------------------------
+    # LOAD TRACKS
+    # --------------------------------------------------------
+
+    house =
+        generate_test_track(
+            "Neon House";
+            bpm=128.0,
+            duration_s=30.0
+        )
+
+    techno =
+        generate_test_track(
+            "Quantum Techno";
+            bpm=132.0,
+            duration_s=30.0
+        )
+
+
+    load_track!(
+        controller.deck_a,
+        house
+    )
+
+    load_track!(
+        controller.deck_b,
+        techno
+    )
+
+
+    # --------------------------------------------------------
+    # PREPARE DECKS
+    # --------------------------------------------------------
+
+    set_pitch!(
+        controller.deck_a,
+        0.0
+    )
+
+    set_pitch!(
+        controller.deck_b,
+        -3.03
+    )
+
+
+    sync!(
+        controller.deck_a,
+        controller.deck_b
+    )
+
+
+    # --------------------------------------------------------
+    # HOT CUE
+    # --------------------------------------------------------
+
+    set_cue!(
+        controller.deck_a.cues,
+        1,
+        0.0
+    )
+
+
+    # --------------------------------------------------------
+    # LOOP
+    # --------------------------------------------------------
+
+    quantised_loop!(
+        controller.deck_a,
+        8
+    )
+
+
+    # --------------------------------------------------------
+    # CROSSFADE
+    # --------------------------------------------------------
+
+    set_crossfader!(
+        controller.mixer.crossfader,
+        0.5
+    )
+
+
+    # --------------------------------------------------------
+    # START
+    # --------------------------------------------------------
+
+    start!(
+        controller
+    )
+
+    play!(
+        controller.deck_a
+    )
+
+    play!(
+        controller.deck_b
+    )
+
+
+    # --------------------------------------------------------
+    # RUN ENGINE
+    # --------------------------------------------------------
+
+    for _ in 1:100
+
+        update!(
+            controller,
+            0.01
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # OUTPUT STATUS
+    # --------------------------------------------------------
+
+    println(
+        status(controller)
+    )
+
+    println(
+        "Diagnostics: ",
+        diagnostics(controller)
+    )
+
+end
+
+
+# ============================================================
+# TESTS
+# ============================================================
+
+function self_test()
+
+    controller =
+        iDecksController()
+
+
+    # Track loading
+
+    track =
+        generate_test_track(
+            "Test";
+            bpm=120.0,
+            duration_s=10.0
+        )
+
+    load_track!(
+        controller.deck_a,
+        track
+    )
+
+    @assert controller.deck_a.track !== nothing
+
+    @assert controller.deck_a.state ==
+            DECK_CUED
+
+
+    # Playback
+
+    play!(
+        controller.deck_a
+    )
+
+    @assert controller.deck_a.state ==
+            DECK_PLAYING
+
+
+    update!(
+        controller,
+        0.5
+    )
+
+
+    @assert controller.deck_a.position.seconds >
+            0.0
+
+
+    # Crossfader
+
+    set_crossfader!(
+        controller.mixer.crossfader,
+        0.0
+    )
+
+    a,b =
+        mix_gains(
+            controller.mixer
+        )
+
+    @assert a > b
+
+
+    set_crossfader!(
+        controller.mixer.crossfader,
+        1.0
+    )
+
+    a,b =
+        mix_gains(
+            controller.mixer
+        )
+
+    @assert b > a
+
+
+    # Cue
+
+    set_cue!(
+        controller.deck_a.cues,
+        1,
+        2.0
+    )
+
+    cue_position =
+        jump_to_cue!(
+            controller.deck_a.cues,
+            1
+        )
+
+    @assert cue_position == 2.0
+
+
+    # Loop
+
+    quantised_loop!(
+        controller.deck_a,
+        4
+    )
+
+    @assert controller.deck_a.loop.state ==
+            LOOP_ACTIVE
+
+
+    # Safety of stopped engine
+
+    stop!(
+        controller
+
+    )
+
+    @assert !controller.running
+
+
+    true
+
+end
+
+
+# ============================================================
+# EXPORTS
+# ============================================================
+
+export
+    Track,
+    Deck,
+    iDecksController,
+    TrackLibrary,
+    CueSystem,
+    MasterMixer,
+    PerformanceBank,
+    Sampler,
+    SessionRecorder,
+
+    load_track!,
+    play!,
+    pause!,
+    stop!,
+    cue!,
+    seek!,
+    sync!,
+    beat_sync!,
+    set_pitch!,
+    quantised_loop!,
+
+    set_cue!,
+    clear_cue!,
+    jump_to_cue!,
+
+    set_crossfader!,
+    start!,
+    update!,
+    status,
+    diagnostics,
+
+    ButtonEvent,
+    EncoderEvent,
+    FaderEvent,
+
+    generate_test_track,
+    self_test
+
+
+end # module
+
+
+# ============================================================
+# BOOT
+# ============================================================
+
+using .iDecksOS
+
+@assert iDecksOS.self_test()
+
+iDecksOS.demo()
