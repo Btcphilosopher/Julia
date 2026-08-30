@@ -1,0 +1,2846 @@
+# BREADOS
+
+## Intelligent Home Bread-Making Appliance
+
+### Pure Julia — Appliance Control Engine
+
+```julia
+module BreadOS
+
+using Dates
+using Printf
+using Statistics
+
+
+# ============================================================
+#
+#                         BREADOS
+#
+#       INTELLIGENT HOME BREAD-MAKING APPLIANCE
+#
+# ============================================================
+#
+# BreadOS is an appliance-control and process-simulation engine
+# for an automated bread machine.
+#
+# It models:
+#
+#   1. Ingredient loading
+#   2. Ingredient equilibration
+#   3. Kneading
+#   4. Dough development
+#   5. Bulk fermentation
+#   6. Degassing / shaping
+#   7. Final proof
+#   8. Baking
+#   9. Cooling
+#  10. Completion
+#
+# Hardware abstraction:
+#
+#   - Temperature sensor
+#   - Heater
+#   - Motor
+#   - Lid sensor
+#   - Dough sensor
+#   - Current sensor
+#   - Fan
+#   - Buzzer
+#
+# Control architecture:
+#
+#                 RECIPE
+#                    │
+#                    ▼
+#              PROCESS ENGINE
+#                    │
+#       ┌────────────┼────────────┐
+#       │            │            │
+#   TEMPERATURE     MOTOR       SAFETY
+#       │            │            │
+#       └────────────┼────────────┘
+#                    │
+#                 TELEMETRY
+#                    │
+#                    ▼
+#               BREAD PRODUCT
+#
+# This is a control-system simulation.
+#
+# Real hardware must use independent hardware safety systems,
+# rated heaters, thermal cut-outs, motor protection and validated
+# food-contact components.
+#
+# ============================================================
+
+
+# ============================================================
+# ENUMERATIONS
+# ============================================================
+
+@enum BreadState begin
+
+    IDLE
+
+    LOADING
+
+    PREHEAT
+
+    AUTOLYSE
+
+    KNEADING
+
+    REST
+
+    BULK_FERMENTATION
+
+    PUNCH_DOWN
+
+    SHAPING
+
+    FINAL_PROOF
+
+    BAKING
+
+    CRUST_FINISH
+
+    COOLING
+
+    COMPLETE
+
+    CLEANING
+
+    FAULT
+
+    EMERGENCY_STOP
+
+end
+
+
+@enum DoughPhase begin
+
+    DOUGH_EMPTY
+
+    DOUGH_MIXING
+
+    DOUGH_DEVELOPMENT
+
+    DOUGH_RISING
+
+    DOUGH_PROOFING
+
+    DOUGH_BAKING
+
+    BREAD_FINISHED
+
+end
+
+
+# ============================================================
+# INGREDIENT SYSTEM
+# ============================================================
+
+struct Ingredients
+
+    flour_g::Float64
+
+    water_g::Float64
+
+    yeast_g::Float64
+
+    salt_g::Float64
+
+    sugar_g::Float64
+
+    fat_g::Float64
+
+    milk_powder_g::Float64
+
+end
+
+
+function Ingredients(;
+
+    flour_g=500.0,
+    water_g=325.0,
+    yeast_g=7.0,
+    salt_g=10.0,
+    sugar_g=15.0,
+    fat_g=15.0,
+    milk_powder_g=0.0
+
+)
+
+    Ingredients(
+
+        Float64(flour_g),
+        Float64(water_g),
+        Float64(yeast_g),
+        Float64(salt_g),
+        Float64(sugar_g),
+        Float64(fat_g),
+        Float64(milk_powder_g)
+
+    )
+
+end
+
+
+# ============================================================
+# RECIPE
+# ============================================================
+
+struct BreadRecipe
+
+    name::String
+
+    ingredients::Ingredients
+
+    target_dough_temperature::Float64
+
+    knead_seconds::Float64
+
+    rest_seconds::Float64
+
+    bulk_seconds::Float64
+
+    proof_seconds::Float64
+
+    bake_seconds::Float64
+
+    bake_temperature::Float64
+
+    crust_intensity::Float64
+
+    knead_rpm::Float64
+
+end
+
+
+function BreadRecipe(;
+
+    name="Classic White Loaf",
+
+    ingredients=Ingredients(),
+
+    target_dough_temperature=27.0,
+
+    knead_seconds=480.0,
+
+    rest_seconds=120.0,
+
+    bulk_seconds=2400.0,
+
+    proof_seconds=1800.0,
+
+    bake_seconds=2400.0,
+
+    bake_temperature=190.0,
+
+    crust_intensity=0.70,
+
+    knead_rpm=80.0
+
+)
+
+    BreadRecipe(
+
+        name,
+
+        ingredients,
+
+        target_dough_temperature,
+
+        knead_seconds,
+
+        rest_seconds,
+
+        bulk_seconds,
+
+        proof_seconds,
+
+        bake_seconds,
+
+        bake_temperature,
+
+        crust_intensity,
+
+        knead_rpm
+
+    )
+
+end
+
+
+# ============================================================
+# DOUGH MODEL
+# ============================================================
+
+mutable struct Dough
+
+    mass_g::Float64
+
+    hydration::Float64
+
+    temperature_c::Float64
+
+    gluten_development::Float64
+
+    fermentation::Float64
+
+    proof::Float64
+
+    elasticity::Float64
+
+    stickiness::Float64
+
+    volume_ratio::Float64
+
+end
+
+
+function Dough(
+    ingredients::Ingredients,
+    temperature_c::Float64
+)
+
+    flour =
+        ingredients.flour_g
+
+
+    water =
+        ingredients.water_g
+
+
+    total =
+        ingredients.flour_g +
+        ingredients.water_g +
+        ingredients.yeast_g +
+        ingredients.salt_g +
+        ingredients.sugar_g +
+        ingredients.fat_g +
+        ingredients.milk_powder_g
+
+
+    Dough(
+
+        total,
+
+        water / flour,
+
+        temperature_c,
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        0.15,
+
+        0.50,
+
+        1.0
+
+    )
+
+end
+
+
+# ============================================================
+# HEATER
+# ============================================================
+
+mutable struct Heater
+
+    enabled::Bool
+
+    power_percent::Float64
+
+    maximum_power_percent::Float64
+
+end
+
+
+Heater() =
+    Heater(
+
+        false,
+
+        0.0,
+
+        100.0
+
+    )
+
+
+function set_power!(
+
+    heater::Heater,
+
+    power::Real
+
+)
+
+    heater.power_percent =
+        clamp(
+
+            Float64(power),
+
+            0.0,
+
+            heater.maximum_power_percent
+
+        )
+
+    heater.enabled =
+        heater.power_percent > 0
+
+end
+
+
+function stop!(
+    heater::Heater
+)
+
+    heater.enabled =
+        false
+
+    heater.power_percent =
+        0.0
+
+end
+
+
+# ============================================================
+# TEMPERATURE SENSOR
+# ============================================================
+
+mutable struct TemperatureSensor
+
+    temperature_c::Float64
+
+    ambient_c::Float64
+
+    minimum_c::Float64
+
+    maximum_c::Float64
+
+    healthy::Bool
+
+end
+
+
+function TemperatureSensor(;
+
+    initial=22.0,
+    ambient=22.0,
+    minimum=0.0,
+    maximum=250.0
+
+)
+
+    TemperatureSensor(
+
+        Float64(initial),
+        Float64(ambient),
+        Float64(minimum),
+        Float64(maximum),
+        true
+
+    )
+
+end
+
+
+# ============================================================
+# MOTOR
+# ============================================================
+
+mutable struct Motor
+
+    enabled::Bool
+
+    rpm::Float64
+
+    target_rpm::Float64
+
+    maximum_rpm::Float64
+
+    current_a::Float64
+
+end
+
+
+function Motor(;
+
+    maximum_rpm=150.0
+
+)
+
+    Motor(
+
+        false,
+        0.0,
+        0.0,
+        Float64(maximum_rpm),
+        0.0
+
+    )
+
+end
+
+
+function set_rpm!(
+
+    motor::Motor,
+
+    rpm::Real
+
+)
+
+    motor.target_rpm =
+        clamp(
+
+            Float64(rpm),
+
+            0.0,
+
+            motor.maximum_rpm
+
+        )
+
+    motor.enabled =
+        motor.target_rpm > 0
+
+end
+
+
+function stop!(
+    motor::Motor
+)
+
+    motor.enabled =
+        false
+
+    motor.target_rpm =
+        0.0
+
+    motor.rpm =
+        0.0
+
+    motor.current_a =
+        0.0
+
+end
+
+
+# ============================================================
+# FAN
+# ============================================================
+
+mutable struct Fan
+
+    enabled::Bool
+
+    speed_percent::Float64
+
+end
+
+
+Fan() =
+    Fan(
+
+        false,
+
+        0.0
+
+    )
+
+
+function set_speed!(
+
+    fan::Fan,
+
+    speed::Real
+
+)
+
+    fan.speed_percent =
+        clamp(
+
+            Float64(speed),
+
+            0.0,
+            100.0
+        )
+
+    fan.enabled =
+        fan.speed_percent > 0
+
+end
+
+
+function stop!(
+    fan::Fan
+)
+
+    fan.enabled =
+        false
+
+    fan.speed_percent =
+        0.0
+
+end
+
+
+# ============================================================
+# SAFETY SYSTEM
+# ============================================================
+
+mutable struct SafetySystem
+
+    lid_closed::Bool
+
+    motor_overcurrent_limit::Float64
+
+    maximum_temperature::Float64
+
+    emergency::Bool
+
+end
+
+
+function SafetySystem()
+
+    SafetySystem(
+
+        true,
+
+        6.0,
+
+        240.0,
+
+        false
+
+    )
+
+end
+
+
+# ============================================================
+# TELEMETRY
+# ============================================================
+
+struct TelemetryPoint
+
+    timestamp::DateTime
+
+    state::BreadState
+
+    dough_phase::DoughPhase
+
+    chamber_temperature_c::Float64
+
+    dough_temperature_c::Float64
+
+    motor_rpm::Float64
+
+    motor_current_a::Float64
+
+    gluten_development::Float64
+
+    fermentation::Float64
+
+    proof::Float64
+
+    dough_volume_ratio::Float64
+
+end
+
+
+mutable struct Telemetry
+
+    points::Vector{TelemetryPoint}
+
+end
+
+
+Telemetry() =
+    Telemetry(
+        TelemetryPoint[]
+    )
+
+
+function record!(
+
+    telemetry::Telemetry,
+
+    machine
+
+)
+
+    dough =
+        machine.dough
+
+
+    dough === nothing &&
+        return
+
+
+    push!(
+
+        telemetry.points,
+
+        TelemetryPoint(
+
+            now(),
+
+            machine.state,
+
+            machine.dough_phase,
+
+            machine.temperature.temperature_c,
+
+            dough.temperature_c,
+
+            machine.motor.rpm,
+
+            machine.motor.current_a,
+
+            dough.gluten_development,
+
+            dough.fermentation,
+
+            dough.proof,
+
+            dough.volume_ratio
+
+        )
+
+    )
+
+end
+
+
+# ============================================================
+# BREAD PRODUCT
+# ============================================================
+
+mutable struct BreadProduct
+
+    mass_g::Float64
+
+    crust_score::Float64
+
+    crumb_score::Float64
+
+    moisture_score::Float64
+
+    overall_score::Float64
+
+end
+
+
+BreadProduct() =
+    BreadProduct(
+
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+
+    )
+
+
+# ============================================================
+# BATCH
+# ============================================================
+
+mutable struct Batch
+
+    id::String
+
+    start_time::Union{Nothing,DateTime}
+
+    end_time::Union{Nothing,DateTime}
+
+    recipe_name::String
+
+end
+
+
+# ============================================================
+# BREAD MACHINE
+# ============================================================
+
+mutable struct BreadMachine
+
+    name::String
+
+    state::BreadState
+
+    dough_phase::DoughPhase
+
+    recipe::BreadRecipe
+
+    ingredients::Ingredients
+
+    dough::Union{Nothing,Dough}
+
+    product::BreadProduct
+
+    heater::Heater
+
+    temperature::TemperatureSensor
+
+    motor::Motor
+
+    fan::Fan
+
+    safety::SafetySystem
+
+    telemetry::Telemetry
+
+    batch::Union{Nothing,Batch}
+
+    elapsed::Float64
+
+    state_elapsed::Float64
+
+    emergency::Bool
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function BreadMachine(
+
+    name::String,
+
+    recipe::BreadRecipe
+
+)
+
+    BreadMachine(
+
+        name,
+
+        IDLE,
+
+        DOUGH_EMPTY,
+
+        recipe,
+
+        recipe.ingredients,
+
+        nothing,
+
+        BreadProduct(),
+
+        Heater(),
+
+        TemperatureSensor(),
+
+        Motor(),
+
+        Fan(),
+
+        SafetySystem(),
+
+        Telemetry(),
+
+        nothing,
+
+        0.0,
+
+        0.0,
+
+        false
+
+    )
+
+end
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+function load_recipe!(
+
+    machine::BreadMachine,
+
+    recipe::BreadRecipe,
+
+    batch_id::String
+
+)
+
+    machine.state == IDLE ||
+        error(
+            "Machine must be idle."
+        )
+
+
+    machine.recipe =
+        recipe
+
+
+    machine.ingredients =
+        recipe.ingredients
+
+
+    machine.batch =
+        Batch(
+
+            batch_id,
+
+            nothing,
+
+            nothing,
+
+            recipe.name
+
+        )
+
+
+    machine.dough =
+        Dough(
+
+            recipe.ingredients,
+
+            machine.temperature.temperature_c
+
+        )
+
+
+    machine.product =
+        BreadProduct()
+
+
+    machine.dough_phase =
+        DOUGH_MIXING
+
+end
+
+
+# ============================================================
+# START
+# ============================================================
+
+function start!(
+    machine::BreadMachine
+)
+
+    machine.dough === nothing &&
+        error(
+            "No dough loaded."
+        )
+
+
+    machine.state =
+        PREHEAT
+
+
+    machine.state_elapsed =
+        0.0
+
+
+    machine.elapsed =
+        0.0
+
+
+    machine.emergency =
+        false
+
+
+    if machine.batch !== nothing
+
+        machine.batch.start_time =
+            now()
+
+    end
+
+end
+
+
+# ============================================================
+# EMERGENCY STOP
+# ============================================================
+
+function emergency_stop!(
+    machine::BreadMachine
+)
+
+    stop!(
+        machine.heater
+    )
+
+    stop!(
+        machine.motor
+    )
+
+    stop!(
+        machine.fan
+    )
+
+
+    machine.safety.emergency =
+        true
+
+
+    machine.emergency =
+        true
+
+
+    machine.state =
+        EMERGENCY_STOP
+
+end
+
+
+# ============================================================
+# THERMAL MODEL
+# ============================================================
+
+function update_temperature!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    temperature =
+        machine.temperature.temperature_c
+
+
+    ambient =
+        machine.temperature.ambient_c
+
+
+    heating =
+        machine.heater.enabled ?
+        machine.heater.power_percent /
+        100.0 *
+        0.45 :
+        0.0
+
+
+    cooling =
+
+        (
+            temperature -
+            ambient
+        ) *
+        0.003
+
+
+    motor_heat =
+        machine.motor.enabled ?
+        machine.motor.rpm *
+        0.0008 :
+        0.0
+
+
+    temperature +=
+
+        (
+            heating +
+            motor_heat -
+            cooling
+        ) * dt
+
+
+    temperature =
+        clamp(
+
+            temperature,
+
+            machine.temperature.minimum_c,
+
+            machine.temperature.maximum_c
+
+        )
+
+
+    machine.temperature.temperature_c =
+        temperature
+
+
+    if machine.dough !== nothing
+
+        dough =
+            machine.dough
+
+
+        dough.temperature_c +=
+
+            (
+                temperature -
+                dough.temperature_c
+            ) *
+            0.015 *
+            dt
+
+    end
+
+end
+
+
+# ============================================================
+# MOTOR MODEL
+# ============================================================
+
+function update_motor!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    motor =
+        machine.motor
+
+
+    if !motor.enabled
+
+        motor.rpm *=
+            max(
+                0.0,
+                1.0 - 4.0 * dt
+            )
+
+        motor.current_a =
+            0.0
+
+        return
+
+    end
+
+
+    difference =
+        motor.target_rpm -
+        motor.rpm
+
+
+    motor.rpm +=
+
+        clamp(
+
+            difference *
+            0.20,
+
+            -20.0,
+            20.0
+
+        )
+
+
+    dough_load =
+        machine.dough === nothing ?
+        0.0 :
+        machine.dough.gluten_development
+
+
+    motor.current_a =
+
+        0.7 +
+        motor.rpm * 0.012 +
+        dough_load * 2.0
+
+end
+
+
+# ============================================================
+# DOUGH PHYSICS
+# ============================================================
+
+function update_dough!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    dough =
+        machine.dough
+
+
+    dough === nothing &&
+        return
+
+
+    state =
+        machine.state
+
+
+    # --------------------------------------------------------
+    # Kneading
+    # --------------------------------------------------------
+
+    if state == KNEADING
+
+        motor_factor =
+            clamp(
+
+                machine.motor.rpm /
+                machine.recipe.knead_rpm,
+
+                0.0,
+                1.5
+
+            )
+
+
+        temperature_factor =
+            exp(
+
+                -(
+                    dough.temperature_c -
+                    machine.recipe.target_dough_temperature
+                )^2 /
+                30.0
+
+            )
+
+
+        development_rate =
+
+            0.00045 *
+            motor_factor *
+            temperature_factor
+
+
+        dough.gluten_development +=
+
+            development_rate *
+            dt
+
+
+        dough.gluten_development =
+            clamp(
+
+                dough.gluten_development,
+
+                0.0,
+                1.0
+
+            )
+
+
+        dough.elasticity =
+
+            0.15 +
+            0.75 *
+            dough.gluten_development
+
+
+        dough.stickiness =
+
+            0.50 -
+            0.25 *
+            dough.gluten_development
+
+
+    # --------------------------------------------------------
+    # Fermentation
+    # --------------------------------------------------------
+
+    elseif state == BULK_FERMENTATION ||
+           state == FINAL_PROOF
+
+        target =
+            machine.recipe.target_dough_temperature
+
+
+        temperature_factor =
+
+            exp(
+
+                -(
+                    dough.temperature_c -
+                    target
+                )^2 /
+                18.0
+
+            )
+
+
+        fermentation_rate =
+
+            0.000025 *
+            temperature_factor
+
+
+        dough.fermentation +=
+
+            fermentation_rate *
+            dt
+
+
+        dough.fermentation =
+            clamp(
+
+                dough.fermentation,
+
+                0.0,
+                1.0
+
+            )
+
+
+        if state == FINAL_PROOF
+
+            dough.proof +=
+
+                fermentation_rate *
+                1.3 *
+                dt
+
+
+            dough.proof =
+                clamp(
+
+                    dough.proof,
+
+                    0.0,
+                    1.0
+
+                )
+
+        end
+
+
+        dough.volume_ratio =
+
+            1.0 +
+            1.2 *
+            dough.fermentation +
+            0.5 *
+            dough.proof
+
+
+    # --------------------------------------------------------
+    # Baking
+    # --------------------------------------------------------
+
+    elseif state == BAKING ||
+           state == CRUST_FINISH
+
+        dough.volume_ratio *=
+
+            1.0 +
+            0.00002 *
+            dt
+
+
+        dough.volume_ratio =
+            min(
+
+                dough.volume_ratio,
+
+                2.8
+
+            )
+
+    end
+
+end
+
+
+# ============================================================
+# PREHEAT
+# ============================================================
+
+function preheat_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    target =
+        machine.recipe.target_dough_temperature
+
+
+    error =
+        target -
+        machine.temperature.temperature_c
+
+
+    power =
+
+        clamp(
+
+            50.0 +
+            error * 12.0,
+
+            0.0,
+            100.0
+
+        )
+
+
+    set_power!(
+
+        machine.heater,
+
+        power
+
+    )
+
+
+    machine.state_elapsed +=
+        dt
+
+
+    if abs(error) <= 1.0
+
+        stop!(
+            machine.heater
+        )
+
+
+        machine.state =
+            AUTOLYSE
+
+
+        machine.dough_phase =
+            DOUGH_MIXING
+
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# AUTOLYSE
+# ============================================================
+
+function autolyse_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed +=
+        dt
+
+
+    if machine.state_elapsed >=
+       180.0
+
+        machine.state =
+            KNEADING
+
+        machine.dough_phase =
+            DOUGH_DEVELOPMENT
+
+        machine.state_elapsed =
+            0.0
+
+
+        set_rpm!(
+
+            machine.motor,
+
+            machine.recipe.knead_rpm
+
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# KNEADING
+# ============================================================
+
+function kneading_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed +=
+        dt
+
+
+    target =
+        machine.recipe.target_dough_temperature
+
+
+    error =
+        target -
+        machine.dough.temperature_c
+
+
+    if error > 2.0
+
+        set_rpm!(
+
+            machine.motor,
+
+            machine.recipe.knead_rpm *
+            0.80
+
+        )
+
+    elseif error < -2.0
+
+        set_rpm!(
+
+            machine.motor,
+
+            machine.recipe.knead_rpm *
+            0.60
+
+        )
+
+    else
+
+        set_rpm!(
+
+            machine.motor,
+
+            machine.recipe.knead_rpm
+
+        )
+
+    end
+
+
+    if machine.state_elapsed >=
+       machine.recipe.knead_seconds
+
+        stop!(
+            machine.motor
+        )
+
+
+        machine.state =
+            REST
+
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# REST
+# ============================================================
+
+function rest_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed +=
+        dt
+
+
+    if machine.state_elapsed >=
+       machine.recipe.rest_seconds
+
+        machine.state =
+            BULK_FERMENTATION
+
+        machine.dough_phase =
+            DOUGH_RISING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# BULK FERMENTATION
+# ============================================================
+
+function fermentation_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed +=
+        dt
+
+
+    # Adaptive fermentation:
+    #
+    # The machine does not simply rely on time.
+    # Dough development and temperature influence progress.
+
+    fermentation =
+        machine.dough.fermentation
+
+
+    if fermentation >= 0.80 ||
+       machine.state_elapsed >=
+       machine.recipe.bulk_seconds
+
+        machine.state =
+            PUNCH_DOWN
+
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# PUNCH DOWN
+# ============================================================
+
+function punch_down_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    set_rpm!(
+
+        machine.motor,
+
+        35.0
+
+    )
+
+
+    machine.state_elapsed +=
+        dt
+
+
+    if machine.state_elapsed >=
+       20.0
+
+        stop!(
+            machine.motor
+        )
+
+
+        machine.state =
+            SHAPING
+
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# SHAPING
+# ============================================================
+
+function shaping_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed +=
+        dt
+
+
+    if machine.state_elapsed >=
+       20.0
+
+        machine.state =
+            FINAL_PROOF
+
+        machine.dough_phase =
+            DOUGH_PROOFING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# FINAL PROOF
+# ============================================================
+
+function proof_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    machine.state_elapsed +=
+        dt
+
+
+    proof =
+        machine.dough.proof
+
+
+    if proof >= 0.85 ||
+       machine.state_elapsed >=
+       machine.recipe.proof_seconds
+
+        machine.state =
+            BAKING
+
+        machine.dough_phase =
+            DOUGH_BAKING
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# BAKING
+# ============================================================
+
+function baking_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    target =
+        machine.recipe.bake_temperature
+
+
+    error =
+        target -
+        machine.temperature.temperature_c
+
+
+    # PID-like proportional thermal control.
+
+    power =
+
+        clamp(
+
+            50.0 +
+            error * 3.0,
+
+            0.0,
+            100.0
+
+        )
+
+
+    set_power!(
+
+        machine.heater,
+
+        power
+
+    )
+
+
+    machine.state_elapsed +=
+        dt
+
+
+    if machine.state_elapsed >=
+       machine.recipe.bake_seconds
+
+        stop!(
+            machine.heater
+        )
+
+
+        machine.state =
+            CRUST_FINISH
+
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# CRUST FINISH
+# ============================================================
+
+function crust_finish_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    target =
+        machine.recipe.bake_temperature +
+        10.0 *
+        machine.recipe.crust_intensity
+
+
+    error =
+        target -
+        machine.temperature.temperature_c
+
+
+    set_power!(
+
+        machine.heater,
+
+        clamp(
+
+            error * 5.0,
+
+            0.0,
+            35.0
+
+        )
+
+    )
+
+
+    machine.state_elapsed +=
+        dt
+
+
+    if machine.state_elapsed >=
+       120.0
+
+        stop!(
+            machine.heater
+        )
+
+
+        machine.state =
+            COOLING
+
+
+        machine.state_elapsed =
+            0.0
+
+
+        set_speed!(
+            machine.fan,
+            50.0
+        )
+
+    end
+
+end
+
+
+# ============================================================
+# COOLING
+# ============================================================
+
+function cooling_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    set_speed!(
+        machine.fan,
+        70.0
+    )
+
+
+    machine.state_elapsed +=
+        dt
+
+
+    # Allow product/chamber to cool.
+
+    if machine.temperature.temperature_c <=
+       machine.temperature.ambient_c + 8.0
+
+        stop!(
+            machine.fan
+        )
+
+
+        machine.state =
+            COMPLETE
+
+
+        machine.dough_phase =
+            BREAD_FINISHED
+
+
+        machine.state_elapsed =
+            0.0
+
+    end
+
+end
+
+
+# ============================================================
+# PRODUCT ANALYSIS
+# ============================================================
+
+function calculate_product!(
+    machine::BreadMachine
+)
+
+    dough =
+        machine.dough
+
+
+    dough === nothing &&
+        return
+
+
+    product_mass =
+        dough.mass_g *
+        0.92
+
+
+    crust_score =
+
+        clamp(
+
+            0.60 +
+            machine.recipe.crust_intensity *
+            0.35,
+
+            0.0,
+            1.0
+
+        )
+
+
+    crumb_score =
+
+        clamp(
+
+            0.25 +
+
+            0.40 *
+            dough.gluten_development +
+
+            0.35 *
+            min(
+                dough.proof,
+                1.0
+            ),
+
+            0.0,
+            1.0
+
+        )
+
+
+    moisture_score =
+
+        clamp(
+
+            1.0 -
+            abs(
+                dough.temperature_c -
+                25.0
+            ) /
+            50.0,
+
+            0.0,
+            1.0
+
+        )
+
+
+    overall =
+
+        100.0 *
+
+        (
+
+            0.35 * crust_score +
+            0.45 * crumb_score +
+            0.20 * moisture_score
+
+        )
+
+
+    machine.product.mass_g =
+        product_mass
+
+
+    machine.product.crust_score =
+        crust_score
+
+
+    machine.product.crumb_score =
+        crumb_score
+
+
+    machine.product.moisture_score =
+        moisture_score
+
+
+    machine.product.overall_score =
+        overall
+
+end
+
+
+# ============================================================
+# SAFETY
+# ============================================================
+
+function safety_check!(
+    machine::BreadMachine
+)
+
+    safety =
+        machine.safety
+
+
+    if !safety.lid_closed
+
+        emergency_stop!(
+            machine
+        )
+
+        return false
+
+    end
+
+
+    if machine.temperature.temperature_c >
+       safety.maximum_temperature
+
+        emergency_stop!(
+            machine
+        )
+
+        return false
+
+    end
+
+
+    if machine.motor.current_a >
+       safety.motor_overcurrent_limit
+
+        emergency_stop!(
+            machine
+        )
+
+        return false
+
+    end
+
+
+    if !machine.temperature.healthy
+
+        emergency_stop!(
+            machine
+        )
+
+        return false
+
+    end
+
+
+    true
+
+end
+
+
+# ============================================================
+# PROCESS STATE MACHINE
+# ============================================================
+
+function process_state!(
+
+    machine::BreadMachine,
+
+    dt::Float64
+
+)
+
+    if machine.state == PREHEAT
+
+        preheat_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == AUTOLYSE
+
+        autolyse_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == KNEADING
+
+        kneading_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == REST
+
+        rest_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == BULK_FERMENTATION
+
+        fermentation_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == PUNCH_DOWN
+
+        punch_down_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == SHAPING
+
+        shaping_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == FINAL_PROOF
+
+        proof_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == BAKING
+
+        baking_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == CRUST_FINISH
+
+        crust_finish_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == COOLING
+
+        cooling_step!(
+            machine,
+            dt
+        )
+
+
+    elseif machine.state == COMPLETE
+
+        calculate_product!(
+            machine
+        )
+
+        if machine.batch !== nothing
+
+            machine.batch.end_time =
+                now()
+
+        end
+
+    end
+
+end
+
+
+# ============================================================
+# MASTER CONTROL LOOP
+# ============================================================
+
+function control_step!(
+
+    machine::BreadMachine,
+
+    dt::Float64=1.0
+
+)
+
+    machine.state in
+        (
+            IDLE,
+            COMPLETE,
+            FAULT,
+            EMERGENCY_STOP
+        ) &&
+        return
+
+
+    update_temperature!(
+        machine,
+        dt
+    )
+
+
+    update_motor!(
+        machine,
+        dt
+    )
+
+
+    update_dough!(
+        machine,
+        dt
+    )
+
+
+    process_state!(
+        machine,
+        dt
+    )
+
+
+    safety_check!(
+        machine
+    )
+
+
+    record!(
+        machine.telemetry,
+        machine
+    )
+
+
+    machine.elapsed +=
+        dt
+
+end
+
+
+# ============================================================
+# BREAD QUALITY ANALYTICS
+# ============================================================
+
+function dough_readiness(
+    machine::BreadMachine
+)
+
+    dough =
+        machine.dough
+
+
+    dough === nothing &&
+        return 0.0
+
+
+    development =
+        dough.gluten_development
+
+
+    fermentation =
+        dough.fermentation
+
+
+    proof =
+        dough.proof
+
+
+    temperature_score =
+
+        exp(
+
+            -(
+                dough.temperature_c -
+                machine.recipe.target_dough_temperature
+            )^2 /
+            20.0
+
+        )
+
+
+    100.0 *
+
+    (
+
+        0.35 * development +
+        0.35 * fermentation +
+        0.20 * proof +
+        0.10 * temperature_score
+
+    )
+
+end
+
+
+function bread_quality(
+    machine::BreadMachine
+)
+
+    machine.product.overall_score
+
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function status(
+    machine::BreadMachine
+)
+
+    dough =
+        machine.dough
+
+
+    (
+
+        machine = machine.name,
+
+        state = machine.state,
+
+        dough_phase = machine.dough_phase,
+
+        chamber_temperature_c =
+            machine.temperature.temperature_c,
+
+        dough_temperature_c =
+            dough === nothing ?
+            NaN :
+            dough.temperature_c,
+
+        motor_rpm =
+            machine.motor.rpm,
+
+        motor_current_a =
+            machine.motor.current_a,
+
+        gluten =
+            dough === nothing ?
+            0.0 :
+            dough.gluten_development,
+
+        fermentation =
+            dough === nothing ?
+            0.0 :
+            dough.fermentation,
+
+        proof =
+            dough === nothing ?
+            0.0 :
+            dough.proof,
+
+        volume_ratio =
+            dough === nothing ?
+            1.0 :
+            dough.volume_ratio,
+
+        dough_readiness =
+            dough_readiness(machine),
+
+        bread_quality =
+            bread_quality(machine)
+
+    )
+
+end
+
+
+# ============================================================
+# DISPLAY
+# ============================================================
+
+function display_status!(
+    machine::BreadMachine
+)
+
+    s =
+        status(machine)
+
+
+    println(
+
+        @sprintf(
+
+            "%-20s | CHAMBER %6.1f°C | DOUGH %6.1f°C | RPM %6.1f | GLUTEN %5.1f%% | FERMENT %5.1f%% | %-18s",
+
+            string(s.state),
+
+            s.chamber_temperature_c,
+
+            s.dough_temperature_c,
+
+            s.motor_rpm,
+
+            s.gluten * 100.0,
+
+            s.fermentation * 100.0,
+
+            string(s.dough_phase)
+
+        )
+
+    )
+
+end
+
+
+# ============================================================
+# CLEANING CYCLE
+# ============================================================
+
+function clean!(
+    machine::BreadMachine
+)
+
+    machine.state in
+        (
+            IDLE,
+            COMPLETE
+        ) || error(
+            "Cleaning cannot start while baking."
+        )
+
+
+    machine.state =
+        CLEANING
+
+
+    machine.state_elapsed =
+        0.0
+
+
+    println(
+        "Starting cleaning cycle..."
+    )
+
+
+    # Simulated cleaning sequence.
+
+    for phase in 1:4
+
+        if phase == 1
+
+            println(
+                "CLEAN: chamber rinse"
+            )
+
+        elseif phase == 2
+
+            println(
+                "CLEAN: paddle wash"
+            )
+
+        elseif phase == 3
+
+            println(
+                "CLEAN: sanitation cycle"
+            )
+
+        elseif phase == 4
+
+            println(
+                "CLEAN: drying"
+            )
+
+        end
+
+    end
+
+
+    machine.state =
+        IDLE
+
+    machine.state_elapsed =
+        0.0
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    println()
+    println("="^120)
+    println(
+        "                              BREADOS"
+    )
+    println(
+        "                   INTELLIGENT BREAD APPLIANCE"
+    )
+    println("="^120)
+
+
+    # --------------------------------------------------------
+    # Recipe
+    # --------------------------------------------------------
+
+    ingredients =
+        Ingredients(
+
+            flour_g=500.0,
+
+            water_g=325.0,
+
+            yeast_g=7.0,
+
+            salt_g=10.0,
+
+            sugar_g=15.0,
+
+            fat_g=15.0
+
+        )
+
+
+    recipe =
+        BreadRecipe(
+
+            name="House White",
+
+            ingredients=ingredients,
+
+            target_dough_temperature=27.0,
+
+            knead_seconds=480.0,
+
+            rest_seconds=120.0,
+
+            bulk_seconds=2400.0,
+
+            proof_seconds=1800.0,
+
+            bake_seconds=2400.0,
+
+            bake_temperature=190.0,
+
+            crust_intensity=0.75,
+
+            knead_rpm=80.0
+
+        )
+
+
+    machine =
+        BreadMachine(
+
+            "BREADOS-001",
+
+            recipe
+
+        )
+
+
+    # --------------------------------------------------------
+    # Load
+    # --------------------------------------------------------
+
+    load_recipe!(
+
+        machine,
+
+        recipe,
+
+        "BREAD-2026-0001"
+
+    )
+
+
+    println()
+    println(
+        "RECIPE: ",
+        recipe.name
+    )
+
+
+    println(
+
+        @sprintf(
+
+            "FLOUR: %.1f g | WATER: %.1f g | YEAST: %.1f g | SALT: %.1f g",
+
+            ingredients.flour_g,
+
+            ingredients.water_g,
+
+            ingredients.yeast_g,
+
+            ingredients.salt_g
+
+        )
+
+    )
+
+
+    # --------------------------------------------------------
+    # Start
+    # --------------------------------------------------------
+
+    start!(
+        machine
+    )
+
+
+    println()
+    println(
+        "PROCESS STARTED"
+    )
+
+
+    # --------------------------------------------------------
+    # Simulation
+    # --------------------------------------------------------
+
+    for second in 1:12000
+
+        control_step!(
+            machine,
+            1.0
+        )
+
+
+        if second % 120 == 0
+
+            display_status!(
+                machine
+            )
+
+        end
+
+
+        if machine.state in
+            (
+                COMPLETE,
+                FAULT,
+                EMERGENCY_STOP
+            )
+
+            break
+
+        end
+
+    end
+
+
+    # --------------------------------------------------------
+    # Final analysis
+    # --------------------------------------------------------
+
+    s =
+        status(machine)
+
+
+    println()
+    println("="^120)
+    println(
+        "                              BREAD COMPLETE"
+    )
+    println("="^120)
+
+
+    println(
+        "State: ",
+        s.state
+    )
+
+
+    println(
+
+        @sprintf(
+
+            "Bread mass: %.1f g",
+
+            machine.product.mass_g
+
+        )
+
+    )
+
+
+    println(
+
+        @sprintf(
+
+            "Crust score: %.1f%%",
+
+            machine.product.crust_score *
+            100.0
+
+        )
+
+    )
+
+
+    println(
+
+        @sprintf(
+
+            "Crumb score: %.1f%%",
+
+            machine.product.crumb_score *
+            100.0
+
+        )
+
+    )
+
+
+    println(
+
+        @sprintf(
+
+            "Overall bread quality: %.1f / 100",
+
+            machine.product.overall_score
+
+        )
+
+    )
+
+
+    println(
+
+        "Telemetry samples: ",
+
+        length(
+            machine.telemetry.points
+        )
+
+    )
+
+
+    println("="^120)
+
+end
+
+
+# ============================================================
+# EXPORTS
+# ============================================================
+
+export BreadState
+export DoughPhase
+
+export IDLE
+export LOADING
+export PREHEAT
+export AUTOLYSE
+export KNEADING
+export REST
+export BULK_FERMENTATION
+export PUNCH_DOWN
+export SHAPING
+export FINAL_PROOF
+export BAKING
+export CRUST_FINISH
+export COOLING
+export COMPLETE
+export CLEANING
+export FAULT
+export EMERGENCY_STOP
+
+export Ingredients
+export BreadRecipe
+export Dough
+export BreadProduct
+export BreadMachine
+export Batch
+export TelemetryPoint
+export Telemetry
+
+export load_recipe!
+export start!
+export clean!
+export emergency_stop!
+
+export control_step!
+export safety_check!
+
+export dough_readiness
+export bread_quality
+export status
+export display_status!
+
+export demo
+
+
+end # module BreadOS
+
+
+# ============================================================
+# APPLICATION ENTRY POINT
+# ============================================================
+
+if abspath(PROGRAM_FILE) == @__FILE__
+
+    using .BreadOS
+
+    BreadOS.demo()
+
+end
+```
+
+
+
