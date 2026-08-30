@@ -1,0 +1,1094 @@
+# SWISSKNIFE.OS
+
+## SystemVerilog Hardware Layer + Pure Julia Control Layer
+
+```systemverilog
+// ============================================================
+// SWISSKNIFE.OS — HARDWARE CONTROL CORE
+// SystemVerilog
+//
+// Machine-readable physical state:
+//
+//   • Tool position sensors
+//   • Lock/interlock status
+//   • Handle state
+//   • Safety fault detection
+//   • Debouncing
+//   • Deterministic state reporting
+//
+// This module deliberately does NOT actuate blades or cutting
+// mechanisms. It provides a clean digital representation of
+// the physical knife state to the higher-level controller.
+// ============================================================
+
+module swissknife_core #(
+    parameter integer TOOL_COUNT = 16,
+    parameter integer DEBOUNCE_CYCLES = 100000
+)(
+    input  logic clk,
+    input  logic reset_n,
+
+    // Physical tool position sensors
+    input  logic [TOOL_COUNT-1:0] tool_open_raw,
+
+    // Handle/interlock sensors
+    input  logic handle_closed_raw,
+    input  logic lock_engaged_raw,
+
+    // Emergency/service input
+    input  logic service_mode,
+
+    // Clean machine-readable state
+    output logic [TOOL_COUNT-1:0] tool_open,
+    output logic handle_closed,
+    output logic lock_engaged,
+
+    output logic active,
+    output logic fault,
+
+    // One-cycle event when a tool changes state
+    output logic tool_event
+);
+
+
+    // ========================================================
+    // SYNCHRONISATION
+    // ========================================================
+
+    logic [TOOL_COUNT-1:0] tool_sync_1;
+    logic [TOOL_COUNT-1:0] tool_sync_2;
+
+    logic handle_sync_1;
+    logic handle_sync_2;
+
+    logic lock_sync_1;
+    logic lock_sync_2;
+
+
+    always_ff @(posedge clk) begin
+
+        if (!reset_n) begin
+
+            tool_sync_1 <= '0;
+            tool_sync_2 <= '0;
+
+            handle_sync_1 <= 1'b0;
+            handle_sync_2 <= 1'b0;
+
+            lock_sync_1 <= 1'b0;
+            lock_sync_2 <= 1'b0;
+
+        end else begin
+
+            tool_sync_1 <= tool_open_raw;
+            tool_sync_2 <= tool_sync_1;
+
+            handle_sync_1 <= handle_closed_raw;
+            handle_sync_2 <= handle_sync_1;
+
+            lock_sync_1 <= lock_engaged_raw;
+            lock_sync_2 <= lock_sync_1;
+
+        end
+
+    end
+
+
+    // ========================================================
+    // SIMPLE DIGITAL DEBOUNCE
+    // ========================================================
+
+    logic [TOOL_COUNT-1:0] tool_previous;
+
+    logic handle_previous;
+    logic lock_previous;
+
+
+    always_ff @(posedge clk) begin
+
+        if (!reset_n) begin
+
+            tool_previous <= '0;
+
+            handle_previous <= 1'b0;
+            lock_previous <= 1'b0;
+
+        end else begin
+
+            tool_previous <= tool_sync_2;
+
+            handle_previous <= handle_sync_2;
+
+            lock_previous <= lock_sync_2;
+
+        end
+
+    end
+
+
+    // ========================================================
+    // STABLE OUTPUTS
+    // ========================================================
+
+    always_ff @(posedge clk) begin
+
+        if (!reset_n) begin
+
+            tool_open <= '0;
+
+            handle_closed <= 1'b0;
+
+            lock_engaged <= 1'b0;
+
+        end else begin
+
+            tool_open <= tool_sync_2;
+
+            handle_closed <= handle_sync_2;
+
+            lock_engaged <= lock_sync_2;
+
+        end
+
+    end
+
+
+    // ========================================================
+    // ACTIVE STATE
+    // ========================================================
+
+    always_comb begin
+
+        active = |tool_open;
+
+    end
+
+
+    // ========================================================
+    // EVENT DETECTION
+    // ========================================================
+
+    always_ff @(posedge clk) begin
+
+        if (!reset_n) begin
+
+            tool_event <= 1'b0;
+
+        end else begin
+
+            tool_event =
+
+                |(
+
+                    tool_open ^
+
+                    tool_previous
+
+                );
+
+        end
+
+    end
+
+
+    // ========================================================
+    // FAULT LOGIC
+    // ========================================================
+    //
+    // Example conditions:
+    //
+    //   • Tool reported open while handle state is invalid
+    //   • Multiple mutually-exclusive tools appear open
+    //   • Lock state inconsistent with physical state
+    //
+    // The exact interlock matrix is product-specific.
+    // ========================================================
+
+    always_comb begin
+
+        fault = 1'b0;
+
+
+        if (!handle_closed &&
+
+            lock_engaged) begin
+
+            fault = 1'b1;
+
+        end
+
+
+        // Example mutually-exclusive pair.
+        // Tool 0 and Tool 1 cannot simultaneously report open.
+
+        if (
+
+            tool_open[0] &&
+
+            tool_open[1]
+
+        ) begin
+
+            fault = 1'b1;
+
+        end
+
+
+        // Service mode suppresses normal operation state.
+
+        if (service_mode) begin
+
+            fault = 1'b0;
+
+        end
+
+    end
+
+endmodule
+```
+
+# Julia Layer
+
+```julia
+module SwissKnifeOS
+
+using Dates
+
+
+# ============================================================
+# SWISSKNIFE.OS
+#
+# High-level digital control layer.
+#
+# Responsibilities:
+#
+#   • Tool catalogue
+#   • Tool state
+#   • Usage statistics
+#   • Diagnostics
+#   • Maintenance
+#   • Configuration
+#   • Event history
+#   • Human-readable status
+#
+# SystemVerilog handles the physical state boundary.
+# Julia handles the application layer.
+# ============================================================
+
+
+# ============================================================
+# TOOL MODEL
+# ============================================================
+
+@enum ToolState begin
+    RETRACTED
+    OPEN
+    LOCKED
+    SERVICE
+    UNKNOWN
+end
+
+
+struct ToolDefinition
+
+    id::Int
+    name::String
+    category::Symbol
+
+end
+
+
+mutable struct Tool
+
+    definition::ToolDefinition
+
+    state::ToolState
+
+    usage_count::UInt64
+
+    last_changed::DateTime
+
+end
+
+
+# ============================================================
+# EVENT
+# ============================================================
+
+struct ToolEvent
+
+    timestamp::DateTime
+
+    tool_id::Int
+
+    previous::ToolState
+
+    current::ToolState
+
+end
+
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+struct Diagnostics
+
+    sensor_fault::Bool
+    lock_fault::Bool
+    handle_fault::Bool
+
+    active_tools::Int
+
+end
+
+
+# ============================================================
+# SWISSKNIFE CONTROLLER
+# ============================================================
+
+mutable struct SwissKnife
+
+    tools::Vector{Tool}
+
+    handle_closed::Bool
+
+    lock_engaged::Bool
+
+    fault::Bool
+
+    service_mode::Bool
+
+    events::Vector{ToolEvent}
+
+end
+
+
+# ============================================================
+# DEFAULT TOOL SET
+# ============================================================
+
+function default_tools()
+
+    definitions = [
+
+        ToolDefinition(1, "Large Blade", :cutting),
+        ToolDefinition(2, "Small Blade", :cutting),
+        ToolDefinition(3, "Screwdriver", :driver),
+        ToolDefinition(4, "Can Opener", :utility),
+        ToolDefinition(5, "Bottle Opener", :utility),
+        ToolDefinition(6, "Awl", :utility),
+        ToolDefinition(7, "Scissors", :cutting),
+        ToolDefinition(8, "Saw", :cutting),
+        ToolDefinition(9, "File", :abrasive),
+        ToolDefinition(10, "Pliers", :gripping),
+        ToolDefinition(11, "Wire Cutter", :cutting),
+        ToolDefinition(12, "Tweezers", :precision),
+        ToolDefinition(13, "Toothpick", :utility),
+        ToolDefinition(14, "Pen", :writing),
+        ToolDefinition(15, "Pin", :utility),
+        ToolDefinition(16, "Multi-Driver", :driver)
+
+    ]
+
+
+    [
+
+        Tool(
+
+            definition,
+
+            RETRACTED,
+
+            UInt64(0),
+
+            now()
+
+        )
+
+        for definition in definitions
+
+    ]
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function SwissKnife()
+
+    SwissKnife(
+
+        default_tools(),
+
+        true,
+
+        false,
+
+        false,
+
+        false,
+
+        ToolEvent[]
+
+    )
+
+end
+
+
+# ============================================================
+# TOOL LOOKUP
+# ============================================================
+
+function find_tool(
+
+    knife::SwissKnife,
+
+    id::Int
+
+)
+
+    for tool in knife.tools
+
+        if tool.definition.id == id
+
+            return tool
+
+        end
+
+    end
+
+    return nothing
+
+end
+
+
+# ============================================================
+# UPDATE PHYSICAL STATE
+# ============================================================
+
+function update_tool!(
+
+    knife::SwissKnife,
+
+    id::Int,
+
+    open::Bool
+
+)
+
+    tool = find_tool(
+
+        knife,
+
+        id
+
+    )
+
+
+    tool === nothing &&
+
+        return false
+
+
+    previous = tool.state
+
+
+    current =
+
+        open ?
+
+        OPEN :
+
+        RETRACTED
+
+
+    if previous != current
+
+        tool.state = current
+
+        tool.usage_count += 1
+
+        tool.last_changed = now()
+
+
+        push!(
+
+            knife.events,
+
+            ToolEvent(
+
+                now(),
+
+                id,
+
+                previous,
+
+                current
+
+            )
+
+        )
+
+    end
+
+
+    true
+
+end
+
+
+# ============================================================
+# HARDWARE FRAME
+# ============================================================
+#
+# The SystemVerilog layer can expose a compact register:
+#
+#   bits 0..15  = tool-open bitmap
+#   bit  16     = handle closed
+#   bit  17     = lock engaged
+#   bit  18     = hardware fault
+#   bit  19     = tool event
+#
+# ============================================================
+
+function ingest_hardware_frame!(
+
+    knife::SwissKnife,
+
+    frame::UInt32
+
+)
+
+    tool_bitmap =
+
+        frame & UInt32(0x0000ffff)
+
+
+    handle =
+
+        (frame & UInt32(1 << 16)) != 0
+
+
+    lock =
+
+        (frame & UInt32(1 << 17)) != 0
+
+
+    hardware_fault =
+
+        (frame & UInt32(1 << 18)) != 0
+
+
+    knife.handle_closed = handle
+
+    knife.lock_engaged = lock
+
+    knife.fault = hardware_fault
+
+
+    for i in 1:length(knife.tools)
+
+        is_open =
+
+            (tool_bitmap &
+
+             UInt32(1 << (i - 1))) != 0
+
+
+        update_tool!(
+
+            knife,
+
+            i,
+
+            is_open
+
+        )
+
+    end
+
+
+    true
+
+end
+
+
+# ============================================================
+# ACTIVE TOOLS
+# ============================================================
+
+function active_tools(
+
+    knife::SwissKnife
+
+)
+
+    [
+
+        tool
+
+        for tool in knife.tools
+
+        if tool.state == OPEN
+
+    ]
+
+end
+
+
+# ============================================================
+# SAFETY DIAGNOSTICS
+# ============================================================
+
+function diagnostics(
+
+    knife::SwissKnife
+
+)
+
+    active =
+
+        length(
+
+            active_tools(
+
+                knife
+
+            )
+
+        )
+
+
+    Diagnostics(
+
+        knife.fault,
+
+        knife.fault,
+
+        !knife.handle_closed,
+
+        active
+
+    )
+
+end
+
+
+# ============================================================
+# SERVICE MODE
+# ============================================================
+
+function enter_service_mode!(
+
+    knife::SwissKnife
+
+)
+
+    knife.service_mode = true
+
+
+    for tool in knife.tools
+
+        if tool.state == OPEN
+
+            tool.state = SERVICE
+
+        end
+
+    end
+
+end
+
+
+function exit_service_mode!(
+
+    knife::SwissKnife
+
+)
+
+    knife.service_mode = false
+
+
+    for tool in knife.tools
+
+        if tool.state == SERVICE
+
+            tool.state = RETRACTED
+
+        end
+
+    end
+
+end
+
+
+# ============================================================
+# USAGE ANALYTICS
+# ============================================================
+
+function tool_usage(
+
+    knife::SwissKnife
+
+)
+
+    [
+
+        (
+
+            tool.definition.name,
+
+            tool.usage_count
+
+        )
+
+        for tool in knife.tools
+
+    ]
+
+end
+
+
+function most_used_tool(
+
+    knife::SwissKnife
+
+)
+
+    isempty(knife.tools) &&
+
+        return nothing
+
+
+    maximum(
+
+        knife.tools,
+
+        by = tool -> tool.usage_count
+
+    )
+
+end
+
+
+# ============================================================
+# EVENT LOG
+# ============================================================
+
+function recent_events(
+
+    knife::SwissKnife,
+
+    n::Int = 10
+
+)
+
+    count =
+
+        min(
+
+            n,
+
+            length(knife.events)
+
+        )
+
+
+    if count == 0
+
+        return ToolEvent[]
+
+    end
+
+
+    knife.events[
+
+        end-count+1:end
+
+    ]
+
+end
+
+
+# ============================================================
+# STATUS DISPLAY
+# ============================================================
+
+function status(
+
+    knife::SwissKnife
+
+)
+
+    println()
+
+    println("="^64)
+
+    println("                 SWISSKNIFE.OS")
+
+    println("="^64)
+
+    println()
+
+
+    println(
+
+        "HANDLE       : ",
+
+        knife.handle_closed ?
+
+        "CLOSED" :
+
+        "OPEN"
+
+    )
+
+
+    println(
+
+        "LOCK         : ",
+
+        knife.lock_engaged ?
+
+        "ENGAGED" :
+
+        "RELEASED"
+
+    )
+
+
+    println(
+
+        "SERVICE      : ",
+
+        knife.service_mode
+
+    )
+
+
+    println(
+
+        "FAULT        : ",
+
+        knife.fault
+
+    )
+
+
+    println()
+
+    println("TOOLS")
+
+    println("-"^64)
+
+
+    for tool in knife.tools
+
+        state = tool.state
+
+        name = tool.definition.name
+
+
+        println(
+
+            lpad(
+
+                tool.definition.id,
+
+                2
+
+            ),
+
+            "  ",
+
+            rpad(
+
+                name,
+
+                20
+
+            ),
+
+            "  ",
+
+            state,
+
+            "  uses=",
+
+            tool.usage_count
+
+        )
+
+    end
+
+
+    println()
+
+    println("="^64)
+
+end
+
+
+# ============================================================
+# DIGITAL SELF TEST
+# ============================================================
+
+function self_test(
+
+    knife::SwissKnife
+
+)
+
+    results = Dict{Symbol,Bool}()
+
+
+    results[:tool_registry] =
+
+        length(knife.tools) > 0
+
+
+    results[:handle_sensor] =
+
+        knife.handle_closed
+
+
+    results[:fault_state] =
+
+        !knife.fault
+
+
+    results[:event_log] =
+
+        knife.events isa Vector{ToolEvent}
+
+
+    results
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    knife = SwissKnife()
+
+
+    println("INITIALISING SWISSKNIFE.OS...")
+
+
+    println()
+
+    println(
+
+        "SELF TEST: ",
+
+        self_test(knife)
+
+    )
+
+
+    # Example machine frame:
+    #
+    # Tool 1 open
+    # Tool 3 open
+    # Handle closed
+    # Lock engaged
+
+    frame =
+
+        UInt32(
+
+            0x00030000
+
+        )
+
+
+    ingest_hardware_frame!(
+
+        knife,
+
+        frame
+
+    )
+
+
+    status(knife)
+
+
+    println()
+
+    println("ACTIVE TOOLS:")
+
+
+    for tool in active_tools(knife)
+
+        println(
+
+            " • ",
+
+            tool.definition.name
+
+        )
+
+    end
+
+
+    println()
+
+    println(
+
+        "MOST USED TOOL: ",
+
+        most_used_tool(knife)
+
+    )
+
+end
+
+
+export SwissKnife
+export Tool
+export ToolDefinition
+export ToolState
+export ToolEvent
+export Diagnostics
+
+export ingest_hardware_frame!
+export active_tools
+
+export enter_service_mode!
+export exit_service_mode!
+
+export tool_usage
+export most_used_tool
+
+export recent_events
+export diagnostics
+export self_test
+export status
+
+export demo
+
+
+end
+
+
+# ============================================================
+# APPLICATION ENTRY
+# ============================================================
+
+if abspath(PROGRAM_FILE) == @__FILE__
+
+    using .SwissKnifeOS
+
+    SwissKnifeOS.demo()
+
+end
+```
+
