@@ -1,0 +1,1224 @@
+module PizzaOS
+
+# ============================================================
+# PIZZAOS
+#
+# Smart Pizza Oven Controller
+# Pure Julia
+#
+# CONTROL LAYERS
+#   • Preheat
+#   • Stone / deck temperature
+#   • Air temperature
+#   • Recipe profiles
+#   • Multi-stage cooking
+#   • Heater / burner control
+#   • Door monitoring
+#   • Thermal hysteresis
+#   • Cook timer
+#   • Fault handling
+#   • Energy accounting
+#
+# IMPORTANT:
+# A production oven needs independent hardware thermal
+# cutoffs, flame/ignition protection where applicable,
+# electrical protection, watchdogs and certified controls.
+# Julia should not be the sole safety mechanism.
+# ============================================================
+
+
+const SOFTWARE = "PizzaOS"
+const VERSION = v"1.0.0"
+
+
+# ============================================================
+# OVEN STATES
+# ============================================================
+
+@enum OvenState begin
+    OFF
+    PREHEATING
+    READY
+    COOKING
+    DOOR_OPEN
+    COOLING
+    COMPLETE
+    FAULT
+end
+
+
+# ============================================================
+# COOKING PHASES
+# ============================================================
+
+@enum CookPhase begin
+    NO_PHASE
+    PREHEAT_PHASE
+    BAKE_PHASE
+    FINISH_PHASE
+    REST_PHASE
+end
+
+
+# ============================================================
+# RECIPE
+# ============================================================
+
+struct PizzaRecipe
+
+    name::String
+
+    target_deck_temperature_c::Float64
+
+    target_air_temperature_c::Float64
+
+    bake_time_s::Float64
+
+    finish_time_s::Float64
+
+    rest_time_s::Float64
+
+end
+
+
+# ============================================================
+# BUILT-IN RECIPES
+# ============================================================
+
+const RECIPES = Dict(
+
+    "NEAPOLITAN" =>
+        PizzaRecipe(
+            "Neapolitan",
+            430.0,
+            400.0,
+            90.0,
+            20.0,
+            60.0
+        ),
+
+    "NEW_YORK" =>
+        PizzaRecipe(
+            "New York",
+            320.0,
+            290.0,
+            720.0,
+            60.0,
+            120.0
+        ),
+
+    "ROMAN" =>
+        PizzaRecipe(
+            "Roman",
+            300.0,
+            270.0,
+            600.0,
+            120.0,
+            120.0
+        ),
+
+    "DEEP_DISH" =>
+        PizzaRecipe(
+            "Deep Dish",
+            250.0,
+            230.0,
+            1500.0,
+            180.0,
+            300.0
+        )
+
+)
+
+
+# ============================================================
+# SENSORS
+# ============================================================
+
+Base.@kwdef mutable struct Sensors
+
+    deck_temperature_c::Float64 = 20.0
+
+    air_temperature_c::Float64 = 20.0
+
+    ambient_temperature_c::Float64 = 20.0
+
+    door_open::Bool = false
+
+    temperature_sensor_ok::Bool = true
+
+    power_available::Bool = true
+
+    overtemperature::Bool = false
+
+end
+
+
+# ============================================================
+# ACTUATORS
+# ============================================================
+
+Base.@kwdef mutable struct Outputs
+
+    top_heater::Bool = false
+
+    bottom_heater::Bool = false
+
+    circulation_fan::Bool = false
+
+end
+
+
+function shutdown!(
+    outputs::Outputs
+)
+
+    outputs.top_heater = false
+    outputs.bottom_heater = false
+    outputs.circulation_fan = false
+
+end
+
+
+# ============================================================
+# OVEN
+# ============================================================
+
+mutable struct PizzaOven
+
+    state::OvenState
+
+    phase::CookPhase
+
+    recipe::PizzaRecipe
+
+    sensors::Sensors
+
+    outputs::Outputs
+
+    elapsed_s::Float64
+
+    phase_elapsed_s::Float64
+
+    energy_kwh::Float64
+
+    fault_message::String
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function PizzaOven(
+    recipe::PizzaRecipe
+)
+
+    PizzaOven(
+
+        OFF,
+
+        NO_PHASE,
+
+        recipe,
+
+        Sensors(),
+
+        Outputs(),
+
+        0.0,
+
+        0.0,
+
+        0.0,
+
+        ""
+
+    )
+
+end
+
+
+function PizzaOven()
+
+    PizzaOven(
+        RECIPES["NEAPOLITAN"]
+    )
+
+end
+
+
+# ============================================================
+# SAFETY
+# ============================================================
+
+function safe(
+    oven::PizzaOven
+)
+
+    oven.sensors.power_available &&
+    oven.sensors.temperature_sensor_ok &&
+    !oven.sensors.overtemperature
+
+end
+
+
+# ============================================================
+# SELECT RECIPE
+# ============================================================
+
+function select_recipe!(
+    oven::PizzaOven,
+    recipe_name::String
+)
+
+    key =
+        uppercase(recipe_name)
+
+
+    haskey(
+        RECIPES,
+        key
+    ) ||
+        error(
+            "Unknown pizza recipe: $recipe_name"
+        )
+
+
+    oven.recipe =
+        RECIPES[key]
+
+
+    oven.state =
+        OFF
+
+
+    oven.phase =
+        NO_PHASE
+
+
+    shutdown!(
+        oven.outputs
+    )
+
+
+    oven
+
+end
+
+
+# ============================================================
+# PREHEAT
+# ============================================================
+
+function start_preheat!(
+    oven::PizzaOven
+)
+
+    if !safe(oven)
+
+        oven.state =
+            FAULT
+
+        oven.fault_message =
+            "Safety fault"
+
+        shutdown!(
+            oven.outputs
+        )
+
+        return false
+
+    end
+
+
+    oven.state =
+        PREHEATING
+
+
+    oven.phase =
+        PREHEAT_PHASE
+
+
+    oven.elapsed_s =
+        0.0
+
+
+    oven.phase_elapsed_s =
+        0.0
+
+
+    true
+
+end
+
+
+# ============================================================
+# THERMAL CONTROL
+# ============================================================
+
+function control_heaters!(
+    oven::PizzaOven
+)
+
+    deck =
+        oven.sensors.deck_temperature_c
+
+    air =
+        oven.sensors.air_temperature_c
+
+
+    target_deck =
+        oven.recipe.target_deck_temperature_c
+
+    target_air =
+        oven.recipe.target_air_temperature_c
+
+
+    # --------------------------------------------------------
+    # DECK CONTROL
+    # --------------------------------------------------------
+
+    if deck <
+       target_deck - 8.0
+
+        oven.outputs.bottom_heater =
+            true
+
+    elseif deck >
+           target_deck + 5.0
+
+        oven.outputs.bottom_heater =
+            false
+
+    end
+
+
+    # --------------------------------------------------------
+    # AIR / TOP CONTROL
+    # --------------------------------------------------------
+
+    if air <
+       target_air - 8.0
+
+        oven.outputs.top_heater =
+            true
+
+    elseif air >
+           target_air + 5.0
+
+        oven.outputs.top_heater =
+            false
+
+    end
+
+
+    # --------------------------------------------------------
+    # CIRCULATION
+    # --------------------------------------------------------
+
+    oven.outputs.circulation_fan =
+        oven.outputs.top_heater ||
+        oven.outputs.bottom_heater
+
+end
+
+
+# ============================================================
+# PREHEAT CHECK
+# ============================================================
+
+function preheated(
+    oven::PizzaOven
+)
+
+    oven.sensors.deck_temperature_c >=
+        oven.recipe.target_deck_temperature_c - 5.0
+
+    &&
+    oven.sensors.air_temperature_c >=
+        oven.recipe.target_air_temperature_c - 5.0
+
+end
+
+
+# ============================================================
+# INSERT PIZZA
+# ============================================================
+
+function insert_pizza!(
+    oven::PizzaOven
+)
+
+    if oven.state != READY
+
+        return false
+
+    end
+
+
+    oven.state =
+        COOKING
+
+
+    oven.phase =
+        BAKE_PHASE
+
+
+    oven.elapsed_s =
+        0.0
+
+
+    oven.phase_elapsed_s =
+        0.0
+
+
+    true
+
+end
+
+
+# ============================================================
+# THERMAL MODEL
+#
+# This is a software simulation model rather than a hardware
+# control model.
+# ============================================================
+
+function thermal_step!(
+    oven::PizzaOven,
+    dt::Float64
+)
+
+    deck =
+        oven.sensors.deck_temperature_c
+
+    air =
+        oven.sensors.air_temperature_c
+
+
+    ambient =
+        oven.sensors.ambient_temperature_c
+
+
+    if oven.outputs.bottom_heater
+
+        deck +=
+            0.12 *
+            dt
+
+    else
+
+        deck +=
+            (ambient - deck) *
+            0.0005 *
+            dt
+
+    end
+
+
+    if oven.outputs.top_heater
+
+        air +=
+            0.10 *
+            dt
+
+    else
+
+        air +=
+            (ambient - air) *
+            0.0008 *
+            dt
+
+    end
+
+
+    # Thermal coupling between deck and air.
+
+    transfer =
+        (deck - air) *
+        0.002 *
+        dt
+
+
+    deck -=
+        transfer
+
+    air +=
+        transfer
+
+
+    oven.sensors.deck_temperature_c =
+        deck
+
+
+    oven.sensors.air_temperature_c =
+        air
+
+end
+
+
+# ============================================================
+# MAIN CONTROL LOOP
+# ============================================================
+
+function update!(
+    oven::PizzaOven,
+    dt_s::Real
+)
+
+    dt =
+        max(
+            Float64(dt_s),
+            0.0
+        )
+
+
+    # --------------------------------------------------------
+    # HARD SAFETY
+    # --------------------------------------------------------
+
+    if !safe(oven)
+
+        shutdown!(
+            oven.outputs
+        )
+
+
+        oven.state =
+            FAULT
+
+
+        oven.phase =
+            NO_PHASE
+
+
+        oven.fault_message =
+            "Hardware safety fault"
+
+
+        return :fault
+
+    end
+
+
+    # --------------------------------------------------------
+    # DOOR
+    # --------------------------------------------------------
+
+    if oven.sensors.door_open
+
+        shutdown!(
+            oven.outputs
+        )
+
+
+        if oven.state != FAULT
+
+            oven.state =
+                DOOR_OPEN
+
+        end
+
+
+        return :door_open
+
+    end
+
+
+    # --------------------------------------------------------
+    # DOOR CLOSED RECOVERY
+    # --------------------------------------------------------
+
+    if oven.state == DOOR_OPEN
+
+        oven.state =
+            PREHEATING
+
+    end
+
+
+    # --------------------------------------------------------
+    # STATE MACHINE
+    # --------------------------------------------------------
+
+    if oven.state == OFF
+
+        shutdown!(
+            oven.outputs
+        )
+
+
+    elseif oven.state == PREHEATING
+
+        control_heaters!(
+            oven
+        )
+
+
+        oven.phase_elapsed_s +=
+            dt
+
+
+        if preheated(oven)
+
+            oven.state =
+                READY
+
+            oven.phase =
+                BAKE_PHASE
+
+            oven.phase_elapsed_s =
+                0.0
+
+        end
+
+
+    elseif oven.state == READY
+
+        # Maintain temperature.
+
+        control_heaters!(
+            oven
+        )
+
+
+    elseif oven.state == COOKING
+
+        control_heaters!(
+            oven
+        )
+
+
+        oven.elapsed_s +=
+            dt
+
+        oven.phase_elapsed_s +=
+            dt
+
+
+        # ----------------------------------------------------
+        # BAKE
+        # ----------------------------------------------------
+
+        if oven.phase == BAKE_PHASE
+
+            if oven.phase_elapsed_s >=
+               oven.recipe.bake_time_s
+
+                oven.phase =
+                    FINISH_PHASE
+
+                oven.phase_elapsed_s =
+                    0.0
+
+            end
+
+
+        # ----------------------------------------------------
+        # FINISH
+        # ----------------------------------------------------
+
+        elseif oven.phase == FINISH_PHASE
+
+            if oven.phase_elapsed_s >=
+               oven.recipe.finish_time_s
+
+                oven.phase =
+                    REST_PHASE
+
+                oven.phase_elapsed_s =
+                    0.0
+
+                shutdown!(
+                    oven.outputs
+                )
+
+            end
+
+
+        # ----------------------------------------------------
+        # REST
+        # ----------------------------------------------------
+
+        elseif oven.phase == REST_PHASE
+
+            if oven.phase_elapsed_s >=
+               oven.recipe.rest_time_s
+
+                oven.state =
+                    COMPLETE
+
+                oven.phase =
+                    NO_PHASE
+
+            end
+
+        end
+
+
+    elseif oven.state == COMPLETE
+
+        shutdown!(
+            oven.outputs
+        )
+
+
+    elseif oven.state == COOLING
+
+        shutdown!(
+            oven.outputs
+        )
+
+
+    elseif oven.state == FAULT
+
+        shutdown!(
+            oven.outputs
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # THERMAL SIMULATION
+    # --------------------------------------------------------
+
+    thermal_step!(
+        oven,
+        dt
+    )
+
+
+    # --------------------------------------------------------
+    # ENERGY
+    # --------------------------------------------------------
+
+    power_kw =
+
+        (oven.outputs.top_heater ? 1.5 : 0.0) +
+
+        (oven.outputs.bottom_heater ? 1.5 : 0.0) +
+
+        (oven.outputs.circulation_fan ? 0.05 : 0.0)
+
+
+    oven.energy_kwh +=
+        power_kw *
+        dt /
+        3600.0
+
+
+    oven.elapsed_s +=
+        dt
+
+
+    return oven.state
+
+end
+
+
+# ============================================================
+# COOLING
+# ============================================================
+
+function start_cooling!(
+    oven::PizzaOven
+)
+
+    shutdown!(
+        oven.outputs
+    )
+
+
+    oven.state =
+        COOLING
+
+
+    oven.phase =
+        NO_PHASE
+
+
+    true
+
+end
+
+
+# ============================================================
+# RESET FAULT
+# ============================================================
+
+function reset_fault!(
+    oven::PizzaOven
+)
+
+    if oven.state != FAULT
+
+        return true
+
+    end
+
+
+    if !safe(oven)
+
+        return false
+
+    end
+
+
+    oven.state =
+        OFF
+
+
+    oven.phase =
+        NO_PHASE
+
+
+    oven.fault_message =
+        ""
+
+
+    oven.elapsed_s =
+        0.0
+
+
+    oven.phase_elapsed_s =
+        0.0
+
+
+    shutdown!(
+        oven.outputs
+    )
+
+
+    true
+
+end
+
+
+# ============================================================
+# STATUS DISPLAY
+# ============================================================
+
+function status(
+    oven::PizzaOven
+)
+
+    println()
+    println("==============================================")
+    println("                 PIZZAOS")
+    println("              VERSION ", VERSION)
+    println("==============================================")
+
+    println(
+        "RECIPE       : ",
+        oven.recipe.name
+    )
+
+    println(
+        "STATE        : ",
+        oven.state
+    )
+
+    println(
+        "PHASE        : ",
+        oven.phase
+    )
+
+    println()
+
+    println(
+        "DECK TEMP    : ",
+        round(
+            oven.sensors.deck_temperature_c,
+            digits = 1
+        ),
+        " °C"
+    )
+
+    println(
+        "DECK TARGET  : ",
+        oven.recipe.target_deck_temperature_c,
+        " °C"
+    )
+
+    println()
+
+    println(
+        "AIR TEMP     : ",
+        round(
+            oven.sensors.air_temperature_c,
+            digits = 1
+        ),
+        " °C"
+    )
+
+    println(
+        "AIR TARGET   : ",
+        oven.recipe.target_air_temperature_c,
+        " °C"
+    )
+
+    println()
+
+    println(
+        "TOP HEATER   : ",
+        oven.outputs.top_heater
+    )
+
+    println(
+        "BOTTOM HEATER: ",
+        oven.outputs.bottom_heater
+    )
+
+    println(
+        "FAN          : ",
+        oven.outputs.circulation_fan
+    )
+
+    println()
+
+    println(
+        "COOK TIME    : ",
+        round(
+            oven.elapsed_s,
+            digits = 1
+        ),
+        " s"
+    )
+
+    println(
+        "ENERGY       : ",
+        round(
+            oven.energy_kwh,
+            digits = 3
+        ),
+        " kWh"
+    )
+
+    if !isempty(
+        oven.fault_message
+    )
+
+        println()
+
+        println(
+            "FAULT        : ",
+            oven.fault_message
+        )
+
+    end
+
+    println("==============================================")
+
+end
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+function self_test()
+
+    oven =
+        PizzaOven()
+
+
+    @assert oven.state ==
+            OFF
+
+
+    select_recipe!(
+        oven,
+        "NEAPOLITAN"
+    )
+
+
+    @assert oven.recipe.name ==
+            "Neapolitan"
+
+
+    @assert start_preheat!(
+        oven
+    )
+
+
+    # Simulate preheating.
+
+    for _ in 1:1000
+
+        if oven.state == READY
+
+            break
+
+        end
+
+
+        update!(
+            oven,
+            1.0
+        )
+
+    end
+
+
+    @assert oven.state ==
+            READY
+
+
+    @assert insert_pizza!(
+        oven
+    )
+
+
+    @assert oven.state ==
+            COOKING
+
+
+    # Simulate cooking.
+
+    for _ in 1:200
+
+        update!(
+            oven,
+            1.0
+        )
+
+    end
+
+
+    @assert oven.elapsed_s >
+            0.0
+
+
+    # Test safety fault.
+
+    oven.sensors.overtemperature =
+        true
+
+
+    update!(
+        oven,
+        1.0
+    )
+
+
+    @assert oven.state ==
+            FAULT
+
+
+    @assert !oven.outputs.top_heater
+
+    @assert !oven.outputs.bottom_heater
+
+
+    println(
+        "PizzaOS SELF TEST: PASS"
+    )
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    oven =
+        PizzaOven()
+
+
+    select_recipe!(
+        oven,
+        "NEAPOLITAN"
+    )
+
+
+    println(
+        "Starting ",
+        oven.recipe.name,
+        " pizza profile..."
+    )
+
+
+    start_preheat!(
+        oven
+    )
+
+
+    # Demonstration preheat.
+
+    for _ in 1:1000
+
+        update!(
+            oven,
+            1.0
+        )
+
+
+        if oven.state == READY
+
+            break
+
+        end
+
+    end
+
+
+    status(
+        oven
+    )
+
+
+    if oven.state == READY
+
+        insert_pizza!(
+            oven
+        )
+
+
+        println(
+            "\nPizza inserted."
+        )
+
+
+        for _ in 1:200
+
+            update!(
+                oven,
+                1.0
+            )
+
+
+            if oven.state ==
+               COMPLETE
+
+                break
+
+            end
+
+        end
+
+    end
+
+
+    status(
+        oven
+    )
+
+end
+
+
+end # module
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+using .PizzaOS
+
+PizzaOS.self_test()
+
+PizzaOS.demo()
