@@ -1,0 +1,1392 @@
+module BurgerGrillOS
+
+# ============================================================
+# BURGERGRILL.OS
+#
+# Pure Julia
+# Intelligent burger-grilling control & simulation engine
+#
+# INGREDIENT
+#     ↓
+# PATTERN / SIZE
+#     ↓
+# PREHEAT
+#     ↓
+# SEAR
+#     ↓
+# COOK
+#     ↓
+# FLIP
+#     ↓
+# INTERNAL TEMPERATURE
+#     ↓
+# REST
+#     ↓
+# QUALITY CONTROL
+# ============================================================
+
+
+const SOFTWARE_NAME = "BurgerGrill.OS"
+const VERSION = v"1.0.0"
+
+
+# ============================================================
+# STATES
+# ============================================================
+
+@enum GrillState begin
+    OFF
+    INITIALISING
+    PREHEATING
+    READY
+    SEARING
+    COOKING
+    FLIPPING
+    RESTING
+    COMPLETE
+    CLEANING
+    FAULT
+end
+
+
+# ============================================================
+# DONENESS
+# ============================================================
+
+@enum Doneness begin
+    RARE
+    MEDIUM_RARE
+    MEDIUM
+    MEDIUM_WELL
+    WELL_DONE
+end
+
+
+# ============================================================
+# PATTY SPECIFICATION
+# ============================================================
+
+struct PattySpec
+
+    weight_g::Float64
+    thickness_mm::Float64
+    diameter_mm::Float64
+
+end
+
+
+# ============================================================
+# COOKING PROFILE
+# ============================================================
+
+struct CookingProfile
+
+    doneness::Doneness
+
+    target_internal_c::Float64
+
+    sear_temperature_c::Float64
+
+    maximum_cook_time_s::Float64
+
+    flip_after_s::Float64
+
+    rest_time_s::Float64
+
+end
+
+
+const PROFILES = Dict(
+
+    RARE => CookingProfile(
+        RARE,
+        50.0,
+        230.0,
+        240.0,
+        45.0,
+        60.0
+    ),
+
+    MEDIUM_RARE => CookingProfile(
+        MEDIUM_RARE,
+        54.0,
+        230.0,
+        300.0,
+        60.0,
+        90.0
+    ),
+
+    MEDIUM => CookingProfile(
+        MEDIUM,
+        60.0,
+        225.0,
+        360.0,
+        75.0,
+        120.0
+    ),
+
+    MEDIUM_WELL => CookingProfile(
+        MEDIUM_WELL,
+        65.0,
+        220.0,
+        420.0,
+        90.0,
+        120.0
+    ),
+
+    WELL_DONE => CookingProfile(
+        WELL_DONE,
+        71.0,
+        215.0,
+        480.0,
+        105.0,
+        120.0
+    )
+
+)
+
+
+# ============================================================
+# GRILL SENSOR MODEL
+# ============================================================
+
+Base.@kwdef mutable struct Sensors
+
+    grill_temperature_c::Float64 = 20.0
+
+    patty_temperature_c::Float64 = 5.0
+
+    lid_closed::Bool = true
+
+    patty_present::Bool = false
+
+    grill_ready::Bool = false
+
+    temperature_sensor_ok::Bool = true
+
+    surface_sensor_ok::Bool = true
+
+end
+
+
+# ============================================================
+# GRILL OUTPUTS
+# ============================================================
+
+Base.@kwdef mutable struct Outputs
+
+    heater_enabled::Bool = false
+
+    fan_enabled::Bool = false
+
+    indicator::Bool = false
+
+    state::GrillState = OFF
+
+end
+
+
+function safe_outputs!(
+    outputs::Outputs
+)
+
+    outputs.heater_enabled = false
+    outputs.fan_enabled = false
+    outputs.indicator = false
+
+end
+
+
+# ============================================================
+# BURGER BATCH
+# ============================================================
+
+mutable struct BurgerBatch
+
+    patty::PattySpec
+
+    doneness::Doneness
+
+    side::Int
+
+    elapsed_s::Float64
+
+    internal_temperature_c::Float64
+
+    surface_temperature_c::Float64
+
+    flip_count::Int
+
+    quality_score::Float64
+
+end
+
+
+# ============================================================
+# GRILL
+# ============================================================
+
+mutable struct BurgerGrill
+
+    state::GrillState
+
+    sensors::Sensors
+
+    outputs::Outputs
+
+    profile::CookingProfile
+
+    batch::Union{Nothing,BurgerBatch}
+
+    target_grill_temperature_c::Float64
+
+    elapsed_s::Float64
+
+    fault_message::String
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function BurgerGrill()
+
+    BurgerGrill(
+
+        OFF,
+
+        Sensors(),
+
+        Outputs(),
+
+        PROFILES[MEDIUM],
+
+        nothing,
+
+        225.0,
+
+        0.0,
+
+        ""
+
+    )
+
+end
+
+
+# ============================================================
+# SELECT DONENESS
+# ============================================================
+
+function select_doneness!(
+    grill::BurgerGrill,
+    doneness::Doneness
+)
+
+    if grill.state ∉ (
+        OFF,
+        READY
+    )
+
+        return false
+
+    end
+
+
+    grill.profile =
+        PROFILES[doneness]
+
+
+    true
+
+end
+
+
+# ============================================================
+# SAFETY CHECK
+# ============================================================
+
+function safe(
+    grill::BurgerGrill
+)
+
+    grill.sensors.temperature_sensor_ok &&
+    grill.sensors.surface_sensor_ok
+
+end
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+function start!(
+    grill::BurgerGrill
+)
+
+    if grill.state != OFF
+
+        return false
+
+    end
+
+
+    if !safe(grill)
+
+        grill.state =
+            FAULT
+
+        grill.fault_message =
+            "Temperature sensor failure"
+
+        return false
+
+    end
+
+
+    grill.state =
+        INITIALISING
+
+
+    grill.outputs.state =
+        INITIALISING
+
+
+    grill.elapsed_s =
+        0.0
+
+
+    grill.state =
+        PREHEATING
+
+
+    grill.outputs.state =
+        PREHEATING
+
+
+    grill.outputs.heater_enabled =
+        true
+
+
+    true
+
+end
+
+
+# ============================================================
+# PREHEAT
+# ============================================================
+
+function preheated(
+    grill::BurgerGrill
+)
+
+    grill.sensors.grill_temperature_c >=
+    grill.target_grill_temperature_c
+
+end
+
+
+# ============================================================
+# LOAD BURGER
+# ============================================================
+
+function load_patty!(
+    grill::BurgerGrill,
+    patty::PattySpec
+)
+
+    if grill.state != READY
+
+        return false
+
+    end
+
+
+    grill.batch =
+        BurgerBatch(
+
+            patty,
+
+            grill.profile.doneness,
+
+            1,
+
+            0.0,
+
+            5.0,
+
+            grill.sensors.grill_temperature_c,
+
+            0,
+
+            0.0
+
+        )
+
+
+    grill.sensors.patty_present =
+        true
+
+
+    grill.state =
+        SEARING
+
+
+    grill.outputs.state =
+        SEARING
+
+
+    grill.elapsed_s =
+        0.0
+
+
+    true
+
+end
+
+
+# ============================================================
+# THERMAL MODEL
+# ============================================================
+
+function update_patty_temperature!(
+    grill::BurgerGrill,
+    dt::Float64
+)
+
+    batch =
+        grill.batch
+
+
+    batch === nothing &&
+        return
+
+
+    ambient =
+        grill.sensors.grill_temperature_c
+
+
+    current =
+        batch.internal_temperature_c
+
+
+    # Simplified lumped thermal model.
+    #
+    # The coefficient is intentionally a simulation
+    # parameter rather than a real cooking calibration.
+
+    coefficient =
+        0.015 *
+        (batch.patty.thickness_mm /
+         10.0)^(-0.25)
+
+
+    delta =
+        (ambient - current) *
+        coefficient *
+        dt
+
+
+    batch.internal_temperature_c =
+        current + delta
+
+
+    batch.surface_temperature_c =
+        ambient
+
+end
+
+
+# ============================================================
+# QUALITY MODEL
+# ============================================================
+
+function calculate_quality!(
+    grill::BurgerGrill
+)
+
+    batch =
+        grill.batch
+
+
+    batch === nothing &&
+        return
+
+
+    profile =
+        grill.profile
+
+
+    temperature_error =
+        abs(
+            batch.internal_temperature_c -
+            profile.target_internal_c
+        )
+
+
+    temperature_score =
+        max(
+            0.0,
+            100.0 -
+            temperature_error * 10.0
+        )
+
+
+    flip_score =
+        batch.flip_count >= 1 ?
+        100.0 :
+        60.0
+
+
+    batch.quality_score =
+        0.75 *
+        temperature_score +
+        0.25 *
+        flip_score
+
+end
+
+
+# ============================================================
+# FLIP
+# ============================================================
+
+function flip!(
+    grill::BurgerGrill
+)
+
+    batch =
+        grill.batch
+
+
+    batch === nothing &&
+        return false
+
+
+    batch.side =
+        batch.side == 1 ?
+        2 :
+        1
+
+
+    batch.flip_count +=
+        1
+
+
+    grill.state =
+        COOKING
+
+
+    grill.outputs.state =
+        COOKING
+
+
+    true
+
+end
+
+
+# ============================================================
+# MAIN CONTROL LOOP
+# ============================================================
+
+function update!(
+    grill::BurgerGrill,
+    dt_s::Real
+)
+
+    dt =
+        max(
+            Float64(dt_s),
+            0.0
+        )
+
+
+    # --------------------------------------------------------
+    # GLOBAL SAFETY
+    # --------------------------------------------------------
+
+    if !safe(grill)
+
+        safe_outputs!(
+            grill.outputs
+        )
+
+
+        grill.state =
+            FAULT
+
+
+        grill.outputs.state =
+            FAULT
+
+
+        grill.fault_message =
+            "Sensor failure"
+
+
+        return grill.state
+
+    end
+
+
+    # --------------------------------------------------------
+    # STATE MACHINE
+    # --------------------------------------------------------
+
+    if grill.state == PREHEATING
+
+        grill.elapsed_s +=
+            dt
+
+
+        # Simplified thermal ramp.
+
+        temperature_gap =
+            grill.target_grill_temperature_c -
+            grill.sensors.grill_temperature_c
+
+
+        grill.sensors.grill_temperature_c +=
+            min(
+                max(
+                    temperature_gap *
+                    0.08 *
+                    dt,
+                    0.0
+                ),
+                8.0
+            )
+
+
+        grill.outputs.heater_enabled =
+            true
+
+
+        if preheated(grill)
+
+            grill.sensors.grill_ready =
+                true
+
+
+            grill.state =
+                READY
+
+
+            grill.outputs.state =
+                READY
+
+
+            grill.outputs.heater_enabled =
+                false
+
+        end
+
+
+    elseif grill.state == READY
+
+        safe_outputs!(
+            grill.outputs
+        )
+
+
+        grill.outputs.state =
+            READY
+
+
+    elseif grill.state == SEARING
+
+        batch =
+            grill.batch
+
+
+        if batch === nothing
+
+            grill.state =
+                FAULT
+
+            grill.fault_message =
+                "No patty detected"
+
+            return grill.state
+
+        end
+
+
+        grill.elapsed_s +=
+            dt
+
+
+        batch.elapsed_s +=
+            dt
+
+
+        update_patty_temperature!(
+            grill,
+            dt
+        )
+
+
+        # First-side sear.
+
+        if batch.elapsed_s >=
+           grill.profile.flip_after_s
+
+            flip!(
+                grill
+            )
+
+        end
+
+
+    elseif grill.state == COOKING
+
+        batch =
+            grill.batch
+
+
+        if batch === nothing
+
+            grill.state =
+                FAULT
+
+            grill.fault_message =
+                "No active batch"
+
+            return grill.state
+
+        end
+
+
+        grill.elapsed_s +=
+            dt
+
+
+        batch.elapsed_s +=
+            dt
+
+
+        update_patty_temperature!(
+            grill,
+            dt
+        )
+
+
+        calculate_quality!(
+            grill
+        )
+
+
+        # Target internal temperature reached.
+
+        if batch.internal_temperature_c >=
+           grill.profile.target_internal_c
+
+            grill.state =
+                RESTING
+
+
+            grill.outputs.state =
+                RESTING
+
+
+            safe_outputs!(
+                grill.outputs
+            )
+
+
+            batch.elapsed_s =
+                0.0
+
+
+            return grill.state
+
+        end
+
+
+        # Maximum cook time.
+
+        if batch.elapsed_s >=
+           grill.profile.maximum_cook_time_s
+
+            grill.state =
+                FAULT
+
+
+            grill.outputs.state =
+                FAULT
+
+
+            safe_outputs!(
+                grill.outputs
+            )
+
+
+            grill.fault_message =
+                "Maximum cooking time exceeded"
+
+        end
+
+
+    elseif grill.state == RESTING
+
+        batch =
+            grill.batch
+
+
+        batch === nothing &&
+            return grill.state
+
+
+        batch.elapsed_s +=
+            dt
+
+
+        if batch.elapsed_s >=
+           grill.profile.rest_time_s
+
+            calculate_quality!(
+                grill
+            )
+
+
+            grill.state =
+                COMPLETE
+
+
+            grill.outputs.state =
+                COMPLETE
+
+        end
+
+
+    elseif grill.state == COMPLETE
+
+        safe_outputs!(
+            grill.outputs
+        )
+
+
+    elseif grill.state == CLEANING
+
+        safe_outputs!(
+            grill.outputs
+        )
+
+
+    elseif grill.state == FAULT
+
+        safe_outputs!(
+            grill.outputs
+        )
+
+
+    end
+
+
+    grill.state
+
+end
+
+
+# ============================================================
+# FINISH / REMOVE BURGER
+# ============================================================
+
+function remove_burger!(
+    grill::BurgerGrill
+)
+
+    if grill.state != COMPLETE
+
+        return false
+
+    end
+
+
+    grill.sensors.patty_present =
+        false
+
+
+    grill.batch =
+        nothing
+
+
+    grill.state =
+        READY
+
+
+    grill.outputs.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# CLEAN
+# ============================================================
+
+function clean!(
+    grill::BurgerGrill
+)
+
+    if grill.sensors.patty_present
+
+        return false
+
+    end
+
+
+    grill.state =
+        CLEANING
+
+
+    grill.outputs.state =
+        CLEANING
+
+
+    safe_outputs!(
+        grill.outputs
+    )
+
+
+    grill.state =
+        READY
+
+
+    grill.outputs.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# RESET
+# ============================================================
+
+function reset_fault!(
+    grill::BurgerGrill
+)
+
+    if grill.state != FAULT
+
+        return true
+
+    end
+
+
+    if !safe(grill)
+
+        return false
+
+    end
+
+
+    grill.fault_message =
+        ""
+
+
+    grill.elapsed_s =
+        0.0
+
+
+    grill.state =
+        READY
+
+
+    grill.outputs.state =
+        READY
+
+
+    true
+
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function status(
+    grill::BurgerGrill
+)
+
+    println()
+    println("==========================================")
+    println("             BURGERGRILL.OS")
+    println("             VERSION ", VERSION)
+    println("==========================================")
+
+    println(
+        "STATE       : ",
+        grill.state
+    )
+
+    println(
+        "GRILL TEMP  : ",
+        round(
+            grill.sensors.grill_temperature_c,
+            digits = 1
+        ),
+        " °C"
+    )
+
+    println(
+        "TARGET      : ",
+        grill.target_grill_temperature_c,
+        " °C"
+    )
+
+    println(
+        "DONENESS    : ",
+        grill.profile.doneness
+    )
+
+
+    if grill.batch !== nothing
+
+        batch =
+            grill.batch
+
+
+        println(
+            "PATTY       : ",
+            batch.patty.weight_g,
+            " g"
+        )
+
+        println(
+            "THICKNESS   : ",
+            batch.patty.thickness_mm,
+            " mm"
+        )
+
+        println(
+            "SIDE        : ",
+            batch.side
+        )
+
+        println(
+            "INTERNAL    : ",
+            round(
+                batch.internal_temperature_c,
+                digits = 1
+            ),
+            " °C"
+        )
+
+        println(
+            "FLIPS       : ",
+            batch.flip_count
+        )
+
+        println(
+            "QUALITY     : ",
+            round(
+                batch.quality_score,
+                digits = 1
+            ),
+            "%"
+        )
+
+    end
+
+
+    if grill.state == FAULT
+
+        println(
+            "FAULT       : ",
+            grill.fault_message
+        )
+
+    end
+
+
+    println("==========================================")
+
+end
+
+
+# ============================================================
+# MACHINE SNAPSHOT
+# ============================================================
+
+struct GrillSnapshot
+
+    software::String
+
+    version::VersionNumber
+
+    state::GrillState
+
+    doneness::Doneness
+
+    grill_temperature_c::Float64
+
+    patty_temperature_c::Float64
+
+    elapsed_s::Float64
+
+    quality_score::Float64
+
+end
+
+
+function snapshot(
+    grill::BurgerGrill
+)
+
+    patty_temperature =
+        grill.batch === nothing ?
+        0.0 :
+        grill.batch.internal_temperature_c
+
+
+    quality =
+        grill.batch === nothing ?
+        0.0 :
+        grill.batch.quality_score
+
+
+    GrillSnapshot(
+
+        SOFTWARE_NAME,
+
+        VERSION,
+
+        grill.state,
+
+        grill.profile.doneness,
+
+        grill.sensors.grill_temperature_c,
+
+        patty_temperature,
+
+        grill.elapsed_s,
+
+        quality
+
+    )
+
+end
+
+
+# ============================================================
+# DEMONSTRATION
+# ============================================================
+
+function demo()
+
+    grill =
+        BurgerGrill()
+
+
+    start!(
+        grill
+    )
+
+
+    # Simulate preheating.
+
+    for _ in 1:100
+
+        update!(
+            grill,
+            0.5
+        )
+
+        if grill.state == READY
+
+            break
+
+        end
+
+    end
+
+
+    # Select desired doneness.
+
+    select_doneness!(
+        grill,
+        MEDIUM
+    )
+
+
+    # 150 g / 20 mm patty.
+
+    patty =
+        PattySpec(
+
+            150.0,
+
+            20.0,
+
+            110.0
+
+        )
+
+
+    load_patty!(
+        grill,
+        patty
+    )
+
+
+    # Simulate cooking.
+
+    for _ in 1:1000
+
+        update!(
+            grill,
+            0.5
+        )
+
+        if grill.state ∈ (
+            COMPLETE,
+            FAULT
+        )
+
+            break
+
+        end
+
+    end
+
+
+    status(
+        grill
+    )
+
+
+end
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+function self_test()
+
+    grill =
+        BurgerGrill()
+
+
+    @assert start!(
+        grill
+    )
+
+
+    # Bring grill to operating temperature.
+
+    for _ in 1:200
+
+        update!(
+            grill,
+            0.5
+        )
+
+        if grill.state == READY
+
+            break
+
+        end
+
+    end
+
+
+    @assert grill.state ==
+        READY
+
+
+    @assert select_doneness!(
+        grill,
+        MEDIUM
+    )
+
+
+    patty =
+        PattySpec(
+            150.0,
+            20.0,
+            110.0
+        )
+
+
+    @assert load_patty!(
+        grill,
+        patty
+    )
+
+
+    # Simulate.
+
+    for _ in 1:1000
+
+        update!(
+            grill,
+            0.5
+        )
+
+        if grill.state ∈ (
+            COMPLETE,
+            FAULT
+        )
+
+            break
+
+        end
+
+    end
+
+
+    @assert grill.state ==
+        COMPLETE
+
+
+    @assert grill.batch !== nothing
+
+
+    @assert grill.batch.flip_count >=
+        1
+
+
+    @assert grill.batch.quality_score >
+        0
+
+
+    @assert remove_burger!(
+        grill
+    )
+
+
+    @assert grill.batch === nothing
+
+
+    println(
+        "BurgerGrill.OS SELF TEST: PASS"
+    )
+
+end
+
+
+end # module
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+using .BurgerGrillOS
+
+BurgerGrillOS.self_test()
+
+BurgerGrillOS.demo()
