@@ -1,0 +1,1197 @@
+```julia
+module OakBreedingOS
+
+using Random
+using Statistics
+using LinearAlgebra
+
+# ============================================================
+# OAK BREEDING OS
+#
+# Research platform for selective breeding of oak trees.
+#
+# Designed for:
+#   • Germplasm / accession management
+#   • Pedigree tracking
+#   • Phenotypic recording
+#   • Multi-environment trials
+#   • Breeding-value estimation
+#   • Selection indices
+#   • Candidate ranking
+#   • Crossing-plan simulation
+#   • Generation-by-generation simulation
+#
+# This is a research/simulation platform.
+# ============================================================
+
+
+# ============================================================
+# 1. ENUMERATIONS
+# ============================================================
+
+@enum Sex begin
+    FEMALE
+    MALE
+    UNKNOWN
+end
+
+@enum TrialEnvironment begin
+    NURSERY
+    FIELD
+    DROUGHT
+    COLD
+    HIGH_DENSITY
+end
+
+
+# ============================================================
+# 2. TREE GENETICS
+# ============================================================
+
+"""
+Abstract representation of an oak breeding individual.
+
+The genotype is represented as a vector of numerical breeding
+loci for simulation purposes rather than as real genomic data.
+"""
+struct Genotype
+
+    loci::Vector{Float64}
+
+end
+
+
+"""
+Pedigree record.
+"""
+struct Pedigree
+
+    tree_id::Int
+    parent1::Union{Nothing,Int}
+    parent2::Union{Nothing,Int}
+    generation::Int
+
+end
+
+
+"""
+Oak individual.
+"""
+mutable struct OakTree
+
+    id::Int
+    accession::String
+    species::String
+
+    sex::Sex
+
+    genotype::Genotype
+    pedigree::Pedigree
+
+    birth_year::Int
+
+    alive::Bool
+
+end
+
+
+# ============================================================
+# 3. PHENOTYPE
+# ============================================================
+
+"""
+Measured phenotype of an individual in a trial environment.
+"""
+struct Phenotype
+
+    tree_id::Int
+    environment::TrialEnvironment
+
+    height_m::Float64
+    diameter_cm::Float64
+
+    crown_score::Float64
+    health_score::Float64
+
+    drought_score::Float64
+    winter_hardiness::Float64
+
+    acorn_production::Float64
+
+end
+
+
+"""
+Environmental trial.
+"""
+mutable struct Trial
+
+    id::Int
+    name::String
+    environment::TrialEnvironment
+
+    year::Int
+
+    tree_ids::Vector{Int}
+    observations::Vector{Phenotype}
+
+end
+
+
+# ============================================================
+# 4. BREEDING PROGRAM
+# ============================================================
+
+mutable struct BreedingProgram
+
+    name::String
+
+    trees::Dict{Int,OakTree}
+    pedigrees::Dict{Int,Pedigree}
+
+    phenotypes::Vector{Phenotype}
+    trials::Dict{Int,Trial}
+
+    next_tree_id::Int
+    next_trial_id::Int
+
+end
+
+
+function BreedingProgram(
+    name::String
+)
+
+    BreedingProgram(
+
+        name,
+
+        Dict{Int,OakTree}(),
+        Dict{Int,Pedigree}(),
+
+        Phenotype[],
+
+        Dict{Int,Trial}(),
+
+        1,
+        1
+    )
+
+end
+
+
+# ============================================================
+# 5. GENOTYPE CREATION
+# ============================================================
+
+function random_genotype(
+    loci::Int;
+    μ = 0.0,
+    σ = 1.0
+)
+
+    Genotype(
+        μ .+ σ .* randn(loci)
+    )
+
+end
+
+
+# ============================================================
+# 6. REGISTER TREE
+# ============================================================
+
+function register_tree!(
+    program::BreedingProgram;
+
+    accession = "UNKNOWN",
+    species = "Quercus robur",
+    sex = UNKNOWN,
+    genotype = random_genotype(32),
+    parent1 = nothing,
+    parent2 = nothing,
+    generation = 0,
+    birth_year = 0
+
+)
+
+    id = program.next_tree_id
+
+    pedigree = Pedigree(
+        id,
+        parent1,
+        parent2,
+        generation
+    )
+
+    tree = OakTree(
+        id,
+        accession,
+        species,
+        sex,
+        genotype,
+        pedigree,
+        birth_year,
+        true
+    )
+
+    program.trees[id] = tree
+    program.pedigrees[id] = pedigree
+
+    program.next_tree_id += 1
+
+    return id
+
+end
+
+
+# ============================================================
+# 7. GENETIC VALUE
+# ============================================================
+
+"""
+Average simulated genetic merit of an individual.
+"""
+function genetic_value(
+    tree::OakTree
+)
+
+    mean(tree.genotype.loci)
+
+end
+
+
+# ============================================================
+# 8. PHENOTYPE SIMULATION
+# ============================================================
+
+"""
+Translate genotype + environment into simulated phenotype.
+
+Environmental effects are deliberately simplified.
+"""
+function simulate_phenotype(
+    tree::OakTree,
+    environment::TrialEnvironment;
+    year::Int = 1
+)
+
+    g = genetic_value(tree)
+
+    environmental_effect =
+        environment == NURSERY      ? 0.10 :
+        environment == FIELD        ? 0.00 :
+        environment == DROUGHT      ? -0.35 :
+        environment == COLD         ? -0.20 :
+        environment == HIGH_DENSITY ? -0.25 :
+        0.0
+
+
+    height =
+        max(
+            0.1,
+            2.0 +
+            0.80 * g +
+            environmental_effect +
+            0.35 * randn()
+        )
+
+
+    diameter =
+        max(
+            0.5,
+            10.0 +
+            2.2 * g +
+            environmental_effect +
+            1.0 * randn()
+        )
+
+
+    crown =
+        clamp(
+            70.0 +
+            12.0 * g +
+            8.0 * randn(),
+            0.0,
+            100.0
+        )
+
+
+    health =
+        clamp(
+            75.0 +
+            10.0 * g +
+            8.0 * randn(),
+            0.0,
+            100.0
+        )
+
+
+    drought =
+        clamp(
+            70.0 +
+            15.0 * g +
+            7.0 * randn(),
+            0.0,
+            100.0
+        )
+
+
+    winter =
+        clamp(
+            70.0 +
+            14.0 * g +
+            7.0 * randn(),
+            0.0,
+            100.0
+        )
+
+
+    acorns =
+        max(
+            0.0,
+            30.0 +
+            10.0 * g +
+            8.0 * randn()
+        )
+
+
+    Phenotype(
+
+        tree.id,
+
+        environment,
+
+        height,
+        diameter,
+
+        crown,
+        health,
+
+        drought,
+        winter,
+
+        acorns
+    )
+
+end
+
+
+# ============================================================
+# 9. TRIAL CREATION
+# ============================================================
+
+function create_trial!(
+    program::BreedingProgram,
+
+    name::String,
+
+    environment::TrialEnvironment,
+
+    tree_ids::Vector{Int};
+
+    year = 1
+
+)
+
+    id = program.next_trial_id
+
+    observations = Phenotype[]
+
+    for tree_id in tree_ids
+
+        tree =
+            program.trees[tree_id]
+
+        phenotype =
+            simulate_phenotype(
+                tree,
+                environment;
+                year
+            )
+
+        push!(
+            observations,
+            phenotype
+        )
+
+        push!(
+            program.phenotypes,
+            phenotype
+        )
+
+    end
+
+
+    trial = Trial(
+
+        id,
+        name,
+        environment,
+        year,
+
+        tree_ids,
+        observations
+    )
+
+
+    program.trials[id] = trial
+
+    program.next_trial_id += 1
+
+    return id
+
+end
+
+
+# ============================================================
+# 10. PHENOTYPE QUERY
+# ============================================================
+
+function phenotypes_for_tree(
+    program::BreedingProgram,
+    tree_id::Int
+)
+
+    filter(
+        x -> x.tree_id == tree_id,
+        program.phenotypes
+    )
+
+end
+
+
+# ============================================================
+# 11. MEAN PHENOTYPE
+# ============================================================
+
+function mean_trait(
+    observations::Vector{Phenotype},
+    trait::Symbol
+)
+
+    values = [
+        getproperty(x, trait)
+        for x in observations
+    ]
+
+    mean(values)
+
+end
+
+
+# ============================================================
+# 12. BREEDING-VALUE ESTIMATION
+# ============================================================
+
+"""
+Estimate a simple breeding score from repeated phenotype data.
+
+A production implementation could replace this with:
+
+    BLUP
+    mixed models
+    genomic BLUP
+    Bayesian breeding models
+    G×E models
+
+"""
+function breeding_value(
+    program::BreedingProgram,
+    tree_id::Int
+)
+
+    observations =
+        phenotypes_for_tree(
+            program,
+            tree_id
+        )
+
+    isempty(observations) &&
+        return NaN
+
+
+    traits = Float64[]
+
+    for p in observations
+
+        push!(
+            traits,
+            p.height_m
+        )
+
+        push!(
+            traits,
+            p.diameter_cm / 10
+        )
+
+        push!(
+            traits,
+            p.crown_score / 10
+        )
+
+        push!(
+            traits,
+            p.health_score / 10
+        )
+
+        push!(
+            traits,
+            p.drought_score / 10
+        )
+
+        push!(
+            traits,
+            p.winter_hardiness / 10
+        )
+
+    end
+
+
+    mean(traits)
+
+end
+
+
+# ============================================================
+# 13. SELECTION INDEX
+# ============================================================
+
+struct SelectionIndex
+
+    weight_height::Float64
+    weight_diameter::Float64
+    weight_health::Float64
+    weight_drought::Float64
+    weight_hardiness::Float64
+    weight_acorns::Float64
+
+end
+
+
+function selection_score(
+    phenotype::Phenotype,
+    index::SelectionIndex
+)
+
+    index.weight_height *
+        phenotype.height_m +
+
+    index.weight_diameter *
+        phenotype.diameter_cm +
+
+    index.weight_health *
+        phenotype.health_score +
+
+    index.weight_drought *
+        phenotype.drought_score +
+
+    index.weight_hardiness *
+        phenotype.winter_hardiness +
+
+    index.weight_acorns *
+        phenotype.acorn_production
+
+end
+
+
+# ============================================================
+# 14. TREE RANKING
+# ============================================================
+
+function rank_trees(
+    program::BreedingProgram;
+    index::SelectionIndex
+)
+
+    scores = Dict{Int,Float64}()
+
+
+    for tree in values(program.trees)
+
+        observations =
+            phenotypes_for_tree(
+                program,
+                tree.id
+            )
+
+        isempty(observations) &&
+            continue
+
+
+        score =
+            mean(
+                selection_score(
+                    p,
+                    index
+                )
+                for p in observations
+            )
+
+
+        scores[tree.id] = score
+
+    end
+
+
+    sort(
+        collect(scores),
+        by = x -> x[2],
+        rev = true
+    )
+
+end
+
+
+# ============================================================
+# 15. PARENT SELECTION
+# ============================================================
+
+function select_parents(
+    program::BreedingProgram,
+    number::Int;
+    index::SelectionIndex
+)
+
+    ranked =
+        rank_trees(
+            program;
+            index
+        )
+
+
+    n =
+        min(
+            number,
+            length(ranked)
+        )
+
+
+    [
+        ranked[i][1]
+        for i in 1:n
+    ]
+
+end
+
+
+# ============================================================
+# 16. CROSS SIMULATION
+# ============================================================
+
+"""
+Create a simulated offspring from two parents.
+
+This represents a simplified inheritance model for research
+simulation rather than a biological protocol.
+"""
+function cross(
+    program::BreedingProgram,
+    parent1_id::Int,
+    parent2_id::Int;
+
+    generation::Int,
+    accession::String = "CROSS"
+
+)
+
+    p1 =
+        program.trees[parent1_id]
+
+    p2 =
+        program.trees[parent2_id]
+
+
+    loci =
+        length(
+            p1.genotype.loci
+        )
+
+
+    child =
+        Vector{Float64}(
+            undef,
+            loci
+        )
+
+
+    for i in 1:loci
+
+        inherited =
+            rand() < 0.5 ?
+            p1.genotype.loci[i] :
+            p2.genotype.loci[i]
+
+
+        mutation =
+            0.01 * randn()
+
+
+        child[i] =
+            inherited + mutation
+
+    end
+
+
+    sex =
+        rand() < 0.5 ?
+        FEMALE :
+        MALE
+
+
+    register_tree!(
+
+        program;
+
+        accession,
+        species = p1.species,
+
+        sex,
+
+        genotype =
+            Genotype(child),
+
+        parent1 =
+            parent1_id,
+
+        parent2 =
+            parent2_id,
+
+        generation
+
+    )
+
+end
+
+
+# ============================================================
+# 17. CROSSING PLAN
+# ============================================================
+
+struct CrossPlan
+
+    parent1::Int
+    parent2::Int
+
+end
+
+
+function generate_cross_plan(
+    parent_ids::Vector{Int}
+)
+
+    plans = CrossPlan[]
+
+
+    for i in 1:length(parent_ids)
+
+        for j in i+1:length(parent_ids)
+
+            push!(
+                plans,
+                CrossPlan(
+                    parent_ids[i],
+                    parent_ids[j]
+                )
+            )
+
+        end
+
+    end
+
+
+    plans
+
+end
+
+
+# ============================================================
+# 18. GENERATION SIMULATION
+# ============================================================
+
+function generate_offspring!(
+    program::BreedingProgram,
+
+    plans::Vector{CrossPlan},
+
+    offspring_per_cross::Int,
+
+    generation::Int
+)
+
+    offspring = Int[]
+
+
+    for plan in plans
+
+        for n in 1:offspring_per_cross
+
+            id =
+                cross(
+                    program,
+                    plan.parent1,
+                    plan.parent2;
+
+                    generation,
+
+                    accession =
+                        "G$(generation)-$(plan.parent1)-$(plan.parent2)-$(n)"
+                )
+
+
+            push!(
+                offspring,
+                id
+            )
+
+        end
+
+    end
+
+
+    offspring
+
+end
+
+
+# ============================================================
+# 19. PROGRAM SUMMARY
+# ============================================================
+
+function summary(
+    program::BreedingProgram
+)
+
+    println()
+    println("========================================")
+    println(" OAK BREEDING OS")
+    println("========================================")
+
+    println(
+        "PROGRAM      : ",
+        program.name
+    )
+
+    println(
+        "TREES        : ",
+        length(program.trees)
+    )
+
+    println(
+        "TRIALS       : ",
+        length(program.trials)
+    )
+
+    println(
+        "OBSERVATIONS : ",
+        length(program.phenotypes)
+    )
+
+    println("========================================")
+
+end
+
+
+# ============================================================
+# 20. EXPORT DATA
+# ============================================================
+
+function tree_report(
+    program::BreedingProgram
+)
+
+    rows = NamedTuple[]
+
+
+    for tree in values(program.trees)
+
+        observations =
+            phenotypes_for_tree(
+                program,
+                tree.id
+            )
+
+
+        isempty(observations) &&
+            continue
+
+
+        push!(
+            rows,
+
+            (
+                id = tree.id,
+
+                accession =
+                    tree.accession,
+
+                species =
+                    tree.species,
+
+                generation =
+                    tree.pedigree.generation,
+
+                breeding_value =
+                    breeding_value(
+                        program,
+                        tree.id
+                    ),
+
+                observations =
+                    length(observations)
+            )
+        )
+
+    end
+
+
+    rows
+
+end
+
+
+# ============================================================
+# 21. EXAMPLE PROGRAM
+# ============================================================
+
+function demo()
+
+    Random.seed!(42)
+
+
+    program =
+        BreedingProgram(
+            "Oak Resilience Research Programme"
+        )
+
+
+    # --------------------------------------------------------
+    # Founding population
+    # --------------------------------------------------------
+
+    founders = Int[]
+
+
+    for i in 1:30
+
+        id =
+            register_tree!(
+                program;
+
+                accession =
+                    "FOUND-$i",
+
+                species =
+                    "Quercus robur",
+
+                sex =
+                    rand(
+                        (FEMALE, MALE)
+                    ),
+
+                genotype =
+                    random_genotype(32),
+
+                generation = 0,
+
+                birth_year = 2026
+            )
+
+
+        push!(
+            founders,
+            id
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # Common field trial
+    # --------------------------------------------------------
+
+    create_trial!(
+        program,
+
+        "FOUNDERS-FIELD-2026",
+
+        FIELD,
+
+        founders;
+
+        year = 2026
+    )
+
+
+    # --------------------------------------------------------
+    # Drought research trial
+    # --------------------------------------------------------
+
+    create_trial!(
+        program,
+
+        "FOUNDERS-DROUGHT-2026",
+
+        DROUGHT,
+
+        founders;
+
+        year = 2026
+    )
+
+
+    # --------------------------------------------------------
+    # Selection index
+    # --------------------------------------------------------
+
+    index =
+        SelectionIndex(
+
+            1.0,    # height
+
+            1.5,    # diameter
+
+            2.0,    # health
+
+            2.5,    # drought
+
+            2.0,    # winter hardiness
+
+            0.5     # acorn production
+        )
+
+
+    # --------------------------------------------------------
+    # Select elite candidates
+    # --------------------------------------------------------
+
+    parents =
+        select_parents(
+            program,
+            8;
+
+            index
+        )
+
+
+    println()
+    println("SELECTED PARENTS")
+    println("----------------")
+
+    for id in parents
+
+        println(
+            "Tree ",
+            id,
+            " | ",
+            program.trees[id].accession,
+            " | BV = ",
+            round(
+                breeding_value(
+                    program,
+                    id
+                ),
+                digits = 3
+            )
+        )
+
+    end
+
+
+    # --------------------------------------------------------
+    # Crossing plan
+    # --------------------------------------------------------
+
+    plans =
+        generate_cross_plan(
+            parents
+        )
+
+
+    println()
+    println(
+        "CROSS PLANS: ",
+        length(plans)
+    )
+
+
+    # --------------------------------------------------------
+    # Generate next generation
+    # --------------------------------------------------------
+
+    generation_1 =
+        generate_offspring!(
+            program,
+
+            plans,
+
+            5,
+
+            1
+        )
+
+
+    println(
+        "GENERATION 1 OFFSPRING: ",
+        length(generation_1)
+    )
+
+
+    # --------------------------------------------------------
+    # Test generation 1
+    # --------------------------------------------------------
+
+    create_trial!(
+        program,
+
+        "G1-FIELD",
+
+        FIELD,
+
+        generation_1;
+
+        year = 2030
+    )
+
+
+    create_trial!(
+        program,
+
+        "G1-DROUGHT",
+
+        DROUGHT,
+
+        generation_1;
+
+        year = 2030
+    )
+
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    summary(program)
+
+
+    return program
+
+end
+
+
+end # module
+
+
+# ============================================================
+# EXECUTION
+# ============================================================
+
+using .OakBreedingOS
+
+program =
+    OakBreedingOS.demo()
+
+println()
+println("PROGRAM COMPLETE.")
+```
+
