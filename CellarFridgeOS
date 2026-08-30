@@ -1,0 +1,1139 @@
+module CellarFridgeOS
+
+# ============================================================
+# CELLARFRIDGE.OS
+#
+# Pure Julia
+# Wine + Beer Refrigeration & Cellar Management
+#
+# FEATURES
+#   • Dual temperature zones
+#   • Wine temperature management
+#   • Beer temperature management
+#   • Humidity monitoring
+#   • Compressor control
+#   • Circulation fans
+#   • Door monitoring
+#   • Thermal hysteresis
+#   • Energy optimisation
+#   • Inventory tracking
+#   • Temperature alarms
+#   • Fault handling
+#
+# NOTE:
+# A real appliance requires independent hardware thermal
+# protection, compressor protection, electrical protection,
+# sensor redundancy and certified refrigeration controls.
+# ============================================================
+
+
+const SOFTWARE = "CellarFridge.OS"
+const VERSION = v"1.0.0"
+
+
+# ============================================================
+# STATES
+# ============================================================
+
+@enum ZoneState begin
+    OFF
+    COOLING
+    HOLDING
+    WARMING
+    DOOR_OPEN
+    FAULT
+end
+
+
+@enum BeverageType begin
+    RED_WINE
+    WHITE_WINE
+    SPARKLING_WINE
+    LAGER
+    ALE
+    STOUT
+    IPA
+    CIDER
+end
+
+
+# ============================================================
+# BEVERAGE PROFILES
+# ============================================================
+
+struct BeverageProfile
+
+    beverage::BeverageType
+
+    target_temperature_c::Float64
+
+    minimum_temperature_c::Float64
+
+    maximum_temperature_c::Float64
+
+    target_humidity::Float64
+
+end
+
+
+const PROFILES = Dict(
+
+    RED_WINE =>
+        BeverageProfile(
+            RED_WINE,
+            15.0,
+            12.0,
+            18.0,
+            0.65
+        ),
+
+    WHITE_WINE =>
+        BeverageProfile(
+            WHITE_WINE,
+            10.0,
+            7.0,
+            13.0,
+            0.65
+        ),
+
+    SPARKLING_WINE =>
+        BeverageProfile(
+            SPARKLING_WINE,
+            7.0,
+            5.0,
+            10.0,
+            0.65
+        ),
+
+    LAGER =>
+        BeverageProfile(
+            LAGER,
+            5.0,
+            2.0,
+            8.0,
+            0.50
+        ),
+
+    ALE =>
+        BeverageProfile(
+            ALE,
+            10.0,
+            7.0,
+            13.0,
+            0.55
+        ),
+
+    STOUT =>
+        BeverageProfile(
+            STOUT,
+            11.0,
+            8.0,
+            14.0,
+            0.55
+        ),
+
+    IPA =>
+        BeverageProfile(
+            IPA,
+            7.0,
+            4.0,
+            10.0,
+            0.50
+        ),
+
+    CIDER =>
+        BeverageProfile(
+            CIDER,
+            6.0,
+            3.0,
+            9.0,
+            0.50
+        )
+
+)
+
+
+# ============================================================
+# SENSOR SYSTEM
+# ============================================================
+
+Base.@kwdef mutable struct Sensors
+
+    wine_temperature_c::Float64 = 20.0
+
+    beer_temperature_c::Float64 = 20.0
+
+    wine_humidity::Float64 = 0.65
+
+    beer_humidity::Float64 = 0.50
+
+    ambient_temperature_c::Float64 = 20.0
+
+    door_open::Bool = false
+
+    compressor_temperature_c::Float64 = 30.0
+
+    power_available::Bool = true
+
+    wine_sensor_ok::Bool = true
+
+    beer_sensor_ok::Bool = true
+
+    humidity_sensor_ok::Bool = true
+
+end
+
+
+# ============================================================
+# ACTUATORS
+# ============================================================
+
+Base.@kwdef mutable struct Outputs
+
+    wine_compressor::Bool = false
+
+    beer_compressor::Bool = false
+
+    wine_fan::Bool = false
+
+    beer_fan::Bool = false
+
+    circulation_fan::Bool = false
+
+    heater::Bool = false
+
+end
+
+
+function shutdown!(
+    output::Outputs
+)
+
+    output.wine_compressor = false
+    output.beer_compressor = false
+
+    output.wine_fan = false
+    output.beer_fan = false
+
+    output.circulation_fan = false
+
+    output.heater = false
+
+end
+
+
+# ============================================================
+# INVENTORY
+# ============================================================
+
+struct BeverageItem
+
+    name::String
+
+    beverage::BeverageType
+
+    quantity::Int
+
+    target_temperature_c::Float64
+
+end
+
+
+mutable struct Inventory
+
+    items::Vector{BeverageItem}
+
+end
+
+
+Inventory() =
+    Inventory(BeverageItem[])
+
+
+function add!(
+    inventory::Inventory,
+    item::BeverageItem
+)
+
+    push!(
+        inventory.items,
+        item
+    )
+
+end
+
+
+function total_units(
+    inventory::Inventory
+)
+
+    sum(
+        item.quantity
+        for item in inventory.items
+    )
+
+end
+
+
+# ============================================================
+# ZONE
+# ============================================================
+
+mutable struct Zone
+
+    state::ZoneState
+
+    target_temperature_c::Float64
+
+    hysteresis_c::Float64
+
+    energy_kwh::Float64
+
+end
+
+
+# ============================================================
+# FRIDGE
+# ============================================================
+
+mutable struct CellarFridge
+
+    wine::Zone
+
+    beer::Zone
+
+    sensors::Sensors
+
+    outputs::Outputs
+
+    inventory::Inventory
+
+    elapsed_s::Float64
+
+    fault_message::String
+
+end
+
+
+# ============================================================
+# CONSTRUCTOR
+# ============================================================
+
+function CellarFridge()
+
+    CellarFridge(
+
+        Zone(
+            OFF,
+            12.0,
+            1.0,
+            0.0
+        ),
+
+        Zone(
+            OFF,
+            5.0,
+            1.0,
+            0.0
+        ),
+
+        Sensors(),
+
+        Outputs(),
+
+        Inventory(),
+
+        0.0,
+
+        ""
+
+    )
+
+end
+
+
+# ============================================================
+# SAFETY
+# ============================================================
+
+function safe(
+    fridge::CellarFridge
+)
+
+    fridge.sensors.power_available &&
+    fridge.sensors.wine_sensor_ok &&
+    fridge.sensors.beer_sensor_ok &&
+    fridge.sensors.humidity_sensor_ok
+
+end
+
+
+# ============================================================
+# SET TEMPERATURES
+# ============================================================
+
+function set_wine_temperature!(
+    fridge::CellarFridge,
+    temperature_c::Real
+)
+
+    fridge.wine.target_temperature_c =
+        clamp(
+            Float64(temperature_c),
+            5.0,
+            20.0
+        )
+
+end
+
+
+function set_beer_temperature!(
+    fridge::CellarFridge,
+    temperature_c::Real
+)
+
+    fridge.beer.target_temperature_c =
+        clamp(
+            Float64(temperature_c),
+            2.0,
+            15.0
+        )
+
+end
+
+
+# ============================================================
+# PROFILE MODE
+# ============================================================
+
+function set_profile!(
+    fridge::CellarFridge,
+    zone::Symbol,
+    beverage::BeverageType
+)
+
+    profile =
+        PROFILES[beverage]
+
+
+    if zone == :wine
+
+        set_wine_temperature!(
+            fridge,
+            profile.target_temperature_c
+        )
+
+    elseif zone == :beer
+
+        set_beer_temperature!(
+            fridge,
+            profile.target_temperature_c
+        )
+
+    else
+
+        error("Unknown zone")
+
+    end
+
+end
+
+
+# ============================================================
+# START
+# ============================================================
+
+function start!(
+    fridge::CellarFridge
+)
+
+    if !safe(fridge)
+
+        fridge.fault_message =
+            "Sensor or power fault"
+
+        return false
+
+    end
+
+
+    fridge.wine.state =
+        COOLING
+
+
+    fridge.beer.state =
+        COOLING
+
+
+    true
+
+end
+
+
+# ============================================================
+# THERMAL MODEL
+# ============================================================
+
+function cool_zone!(
+    zone::Zone,
+    current_temperature::Float64,
+    target_temperature::Float64,
+    dt::Float64,
+    compressor_on::Bool
+)
+
+    if compressor_on
+
+        delta =
+            (target_temperature -
+             current_temperature) *
+            0.025 *
+            dt
+
+
+        return current_temperature +
+               min(delta, 0.5)
+
+    else
+
+        ambient =
+            20.0
+
+
+        delta =
+            (ambient -
+             current_temperature) *
+            0.001 *
+            dt
+
+
+        return current_temperature +
+               delta
+
+    end
+
+end
+
+
+# ============================================================
+# COMPRESSOR CONTROL
+# ============================================================
+
+function regulate_zone!(
+    zone::Zone,
+    temperature::Float64
+)
+
+    target =
+        zone.target_temperature_c
+
+
+    if temperature >
+       target + zone.hysteresis_c
+
+        zone.state =
+            COOLING
+
+        return true
+
+    elseif temperature <
+           target - zone.hysteresis_c
+
+        zone.state =
+            HOLDING
+
+        return false
+
+    else
+
+        zone.state =
+            HOLDING
+
+        return false
+
+    end
+
+end
+
+
+# ============================================================
+# MAIN CONTROL LOOP
+# ============================================================
+
+function update!(
+    fridge::CellarFridge,
+    dt_s::Real
+)
+
+    dt =
+        max(
+            Float64(dt_s),
+            0.0
+        )
+
+
+    # --------------------------------------------------------
+    # GLOBAL SAFETY
+    # --------------------------------------------------------
+
+    if !safe(fridge)
+
+        shutdown!(
+            fridge.outputs
+        )
+
+
+        fridge.wine.state =
+            FAULT
+
+
+        fridge.beer.state =
+            FAULT
+
+
+        fridge.fault_message =
+            "Safety system fault"
+
+
+        return :fault
+
+    end
+
+
+    # --------------------------------------------------------
+    # DOOR MANAGEMENT
+    # --------------------------------------------------------
+
+    if fridge.sensors.door_open
+
+        fridge.wine.state =
+            DOOR_OPEN
+
+        fridge.beer.state =
+            DOOR_OPEN
+
+
+        fridge.outputs.wine_fan =
+            false
+
+        fridge.outputs.beer_fan =
+            false
+
+    end
+
+
+    # --------------------------------------------------------
+    # WINE ZONE
+    # --------------------------------------------------------
+
+    wine_compressor =
+        regulate_zone!(
+            fridge.wine,
+            fridge.sensors.wine_temperature_c
+        )
+
+
+    # --------------------------------------------------------
+    # BEER ZONE
+    # --------------------------------------------------------
+
+    beer_compressor =
+        regulate_zone!(
+            fridge.beer,
+            fridge.sensors.beer_temperature_c
+        )
+
+
+    # Door-open operation can suspend compressors
+    # depending on appliance strategy.
+
+    if fridge.sensors.door_open
+
+        wine_compressor = false
+        beer_compressor = false
+
+    end
+
+
+    fridge.outputs.wine_compressor =
+        wine_compressor
+
+
+    fridge.outputs.beer_compressor =
+        beer_compressor
+
+
+    fridge.outputs.wine_fan =
+        wine_compressor
+
+
+    fridge.outputs.beer_fan =
+        beer_compressor
+
+
+    fridge.outputs.circulation_fan =
+        wine_compressor ||
+        beer_compressor
+
+
+    # --------------------------------------------------------
+    # THERMAL SIMULATION
+    # --------------------------------------------------------
+
+    fridge.sensors.wine_temperature_c =
+        cool_zone!(
+            fridge.wine,
+            fridge.sensors.wine_temperature_c,
+            fridge.wine.target_temperature_c,
+            dt,
+            wine_compressor
+        )
+
+
+    fridge.sensors.beer_temperature_c =
+        cool_zone!(
+            fridge.beer,
+            fridge.sensors.beer_temperature_c,
+            fridge.beer.target_temperature_c,
+            dt,
+            beer_compressor
+        )
+
+
+    # --------------------------------------------------------
+    # ENERGY ACCOUNTING
+    # --------------------------------------------------------
+
+    if wine_compressor
+
+        fridge.wine.energy_kwh +=
+            0.15 *
+            dt /
+            3600.0
+
+    end
+
+
+    if beer_compressor
+
+        fridge.beer.energy_kwh +=
+            0.15 *
+            dt /
+            3600.0
+
+    end
+
+
+    fridge.elapsed_s +=
+        dt
+
+
+    return :running
+
+end
+
+
+# ============================================================
+# INVENTORY FUNCTIONS
+# ============================================================
+
+function stock!(
+    fridge::CellarFridge,
+    name::String,
+    beverage::BeverageType,
+    quantity::Int
+)
+
+    profile =
+        PROFILES[beverage]
+
+
+    item =
+        BeverageItem(
+
+            name,
+
+            beverage,
+
+            quantity,
+
+            profile.target_temperature_c
+
+        )
+
+
+    add!(
+        fridge.inventory,
+        item
+    )
+
+end
+
+
+function consume!(
+    fridge::CellarFridge,
+    name::String,
+    quantity::Int = 1
+)
+
+    for i in eachindex(
+        fridge.inventory.items
+    )
+
+        item =
+            fridge.inventory.items[i]
+
+
+        if item.name == name
+
+            new_quantity =
+                item.quantity -
+                quantity
+
+
+            if new_quantity <= 0
+
+                deleteat!(
+                    fridge.inventory.items,
+                    i
+                )
+
+            else
+
+                fridge.inventory.items[i] =
+                    BeverageItem(
+                        item.name,
+                        item.beverage,
+                        new_quantity,
+                        item.target_temperature_c
+                    )
+
+            end
+
+
+            return true
+
+        end
+
+    end
+
+
+    return false
+
+end
+
+
+# ============================================================
+# ENERGY OPTIMISATION
+# ============================================================
+
+function eco_mode!(
+    fridge::CellarFridge
+)
+
+    fridge.wine.hysteresis_c =
+        1.5
+
+
+    fridge.beer.hysteresis_c =
+        1.5
+
+
+    true
+
+end
+
+
+function performance_mode!(
+    fridge::CellarFridge
+)
+
+    fridge.wine.hysteresis_c =
+        0.5
+
+
+    fridge.beer.hysteresis_c =
+        0.5
+
+
+    true
+
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function status(
+    fridge::CellarFridge
+)
+
+    println()
+    println("==========================================")
+    println("          CELLARFRIDGE.OS")
+    println("          VERSION ", VERSION)
+    println("==========================================")
+
+    println(
+        "WINE STATE  : ",
+        fridge.wine.state
+    )
+
+    println(
+        "WINE TEMP   : ",
+        round(
+            fridge.sensors.wine_temperature_c,
+            digits = 1
+        ),
+        " °C"
+    )
+
+    println(
+        "WINE TARGET : ",
+        fridge.wine.target_temperature_c,
+        " °C"
+    )
+
+    println()
+
+    println(
+        "BEER STATE  : ",
+        fridge.beer.state
+    )
+
+    println(
+        "BEER TEMP   : ",
+        round(
+            fridge.sensors.beer_temperature_c,
+            digits = 1
+        ),
+        " °C"
+    )
+
+    println(
+        "BEER TARGET : ",
+        fridge.beer.target_temperature_c,
+        " °C"
+    )
+
+    println()
+
+    println(
+        "DOOR        : ",
+        fridge.sensors.door_open ?
+        "OPEN" :
+        "CLOSED"
+    )
+
+    println(
+        "INVENTORY   : ",
+        total_units(
+            fridge.inventory
+        ),
+        " units"
+    )
+
+    println(
+        "WINE ENERGY : ",
+        round(
+            fridge.wine.energy_kwh,
+            digits = 3
+        ),
+        " kWh"
+    )
+
+    println(
+        "BEER ENERGY : ",
+        round(
+            fridge.beer.energy_kwh,
+            digits = 3
+        ),
+        " kWh"
+    )
+
+    println("==========================================")
+
+end
+
+
+# ============================================================
+# SELF TEST
+# ============================================================
+
+function self_test()
+
+    fridge =
+        CellarFridge()
+
+
+    @assert set_profile!(
+        fridge,
+        :wine,
+        WHITE_WINE
+    ) ≈ 10.0
+
+
+    @assert set_profile!(
+        fridge,
+        :beer,
+        LAGER
+    ) ≈ 5.0
+
+
+    @assert start!(
+        fridge
+    )
+
+
+    # Run thermal simulation.
+
+    for _ in 1:1000
+
+        update!(
+            fridge,
+            1.0
+        )
+
+    end
+
+
+    @assert fridge.sensors.wine_temperature_c <
+            20.0
+
+
+    @assert fridge.sensors.beer_temperature_c <
+            20.0
+
+
+    # Inventory.
+
+    stock!(
+        fridge,
+        "House Lager",
+        LAGER,
+        12
+    )
+
+
+    stock!(
+        fridge,
+        "Sauvignon Blanc",
+        WHITE_WINE,
+        6
+    )
+
+
+    @assert total_units(
+        fridge.inventory
+    ) == 18
+
+
+    @assert consume!(
+        fridge,
+        "House Lager"
+    )
+
+
+    @assert total_units(
+        fridge.inventory
+    ) == 17
+
+
+    println(
+        "CellarFridge.OS SELF TEST: PASS"
+    )
+
+end
+
+
+# ============================================================
+# DEMO
+# ============================================================
+
+function demo()
+
+    fridge =
+        CellarFridge()
+
+
+    # Wine zone.
+
+    set_profile!(
+        fridge,
+        :wine,
+        RED_WINE
+    )
+
+
+    # Beer zone.
+
+    set_profile!(
+        fridge,
+        :beer,
+        IPA
+    )
+
+
+    # Stock cellar.
+
+    stock!(
+        fridge,
+        "Bordeaux",
+        RED_WINE,
+        6
+    )
+
+
+    stock!(
+        fridge,
+        "IPA",
+        IPA,
+        12
+    )
+
+
+    stock!(
+        fridge,
+        "Champagne",
+        SPARKLING_WINE,
+        3
+    )
+
+
+    start!(
+        fridge
+    )
+
+
+    # Simulate 30 minutes.
+
+    for _ in 1:1800
+
+        update!(
+            fridge,
+            1.0
+        )
+
+    end
+
+
+    status(
+        fridge
+    )
+
+end
+
+
+end # module
+
+
+# ============================================================
+# RUN
+# ============================================================
+
+using .CellarFridgeOS
+
+CellarFridgeOS.self_test()
+
+CellarFridgeOS.demo()
