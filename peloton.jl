@@ -904,3 +904,483 @@ println(
 
 
 
+
+But:
+
+Strategy B
+
+180 W generation
+40 minute session
+
+gives:
+
+$$ 180 \times 0.667 = 120Wh $$
+
+So they're equal.
+
+If B actually causes the rider to quit after 30 minutes:
+
+$$ 180 \times 0.5 = 90Wh $$
+
+You've lost 25% of the energy.
+
+3. Julia implementation
+
+I'd build the core like this:
+
+module WeightedRegenOptimizer
+
+using Statistics
+
+export RiderState,
+       SystemState,
+       EconomicState,
+       OptimizerConfig,
+       OptimizationResult,
+       weighted_objective,
+       optimise_braking,
+       update_economics
+
+# ---------------------------------------------------------
+# Rider
+# ---------------------------------------------------------
+
+struct RiderState
+    cadence_rpm::Float64
+    rider_power_w::Float64
+    heart_rate_bpm::Float64
+    resistance::Float64
+    fatigue::Float64
+    workout_target_w::Float64
+    session_minutes_remaining::Float64
+end
+
+# ---------------------------------------------------------
+# Electrical system
+# ---------------------------------------------------------
+
+struct SystemState
+    generator_rpm::Float64
+    generator_efficiency::Float64
+    converter_efficiency::Float64
+    inverter_efficiency::Float64
+
+    generator_temperature_c::Float64
+    max_temperature_c::Float64
+
+    battery_soc::Float64
+    battery_max_soc::Float64
+
+    max_generator_power_w::Float64
+end
+
+# ---------------------------------------------------------
+# Economics
+# ---------------------------------------------------------
+
+struct EconomicState
+    electricity_price_gbp_kwh::Float64
+    export_price_gbp_kwh::Float64
+
+    grid_import_avoided::Bool
+    battery_value_multiplier::Float64
+end
+
+# ---------------------------------------------------------
+# Optimiser weights
+# ---------------------------------------------------------
+
+struct OptimizerConfig
+
+    energy_weight::Float64
+    economic_weight::Float64
+
+    rider_penalty_weight::Float64
+    fatigue_penalty_weight::Float64
+
+    thermal_penalty_weight::Float64
+    discomfort_penalty_weight::Float64
+
+    min_cadence_rpm::Float64
+    max_cadence_rpm::Float64
+
+    max_extra_resistance_w::Float64
+
+    optimisation_resolution::Int
+end
+
+# ---------------------------------------------------------
+# Result
+# ---------------------------------------------------------
+
+struct OptimizationResult
+
+    braking_power_w::Float64
+    generated_power_w::Float64
+
+    recovered_energy_wh::Float64
+    economic_value_gbp::Float64
+
+    rider_penalty::Float64
+    fatigue_penalty::Float64
+    thermal_penalty::Float64
+    discomfort_penalty::Float64
+
+    objective_value::Float64
+end
+
+
+# ---------------------------------------------------------
+# System efficiency
+# ---------------------------------------------------------
+
+function total_efficiency(sys::SystemState)
+
+    return sys.generator_efficiency *
+           sys.converter_efficiency *
+           sys.inverter_efficiency
+
+end
+
+
+# ---------------------------------------------------------
+# Generator output
+# ---------------------------------------------------------
+
+function generated_power(
+    mechanical_power::Float64,
+    sys::SystemState
+)
+
+    η = total_efficiency(sys)
+
+    electrical = mechanical_power * η
+
+    return min(
+        electrical,
+        sys.max_generator_power_w
+    )
+
+end
+
+
+# ---------------------------------------------------------
+# Economic value
+# ---------------------------------------------------------
+
+function energy_value(
+    energy_wh::Float64,
+    econ::EconomicState
+)
+
+    kwh = energy_wh / 1000.0
+
+    if econ.grid_import_avoided
+
+        return kwh *
+               econ.electricity_price_gbp_kwh *
+               econ.battery_value_multiplier
+
+    else
+
+        return kwh *
+               econ.export_price_gbp_kwh
+
+    end
+
+end
+
+
+# ---------------------------------------------------------
+# Rider penalty
+# ---------------------------------------------------------
+
+function rider_penalty(
+    braking_power::Float64,
+    rider::RiderState
+)
+
+    relative =
+        braking_power /
+        max(rider.rider_power_w, 1.0)
+
+    return relative^2
+
+end
+
+
+# ---------------------------------------------------------
+# Fatigue penalty
+# ---------------------------------------------------------
+
+function fatigue_penalty(
+    braking_power::Float64,
+    rider::RiderState
+)
+
+    fatigue =
+        clamp(rider.fatigue, 0.0, 1.0)
+
+    load =
+        braking_power /
+        max(rider.workout_target_w, 1.0)
+
+    return fatigue * load^2
+
+end
+
+
+# ---------------------------------------------------------
+# Thermal penalty
+# ---------------------------------------------------------
+
+function thermal_penalty(
+    sys::SystemState
+)
+
+    temperature_ratio =
+        sys.generator_temperature_c /
+        sys.max_temperature_c
+
+    if temperature_ratio < 0.7
+        return 0.0
+    end
+
+    return ((temperature_ratio - 0.7) / 0.3)^2
+
+end
+
+
+# ---------------------------------------------------------
+# Discomfort penalty
+# ---------------------------------------------------------
+
+function discomfort_penalty(
+    braking_power::Float64,
+    rider::RiderState
+)
+
+    # Don't make the generator dominate
+    # the rider's own exercise effort.
+
+    ratio =
+        braking_power /
+        max(rider.rider_power_w, 1.0)
+
+    if ratio <= 0.30
+        return 0.0
+    end
+
+    return (ratio - 0.30)^2
+
+end
+
+
+# ---------------------------------------------------------
+# Weighted objective
+# ---------------------------------------------------------
+
+function weighted_objective(
+    braking_power::Float64,
+    rider::RiderState,
+    sys::SystemState,
+    econ::EconomicState,
+    cfg::OptimizerConfig,
+    horizon_minutes::Float64
+)
+
+    electrical =
+        generated_power(
+            braking_power,
+            sys
+        )
+
+    energy =
+        electrical *
+        horizon_minutes /
+        60.0
+
+    value =
+        energy_value(
+            energy,
+            econ
+        )
+
+    rider_cost =
+        rider_penalty(
+            braking_power,
+            rider
+        )
+
+    fatigue_cost =
+        fatigue_penalty(
+            braking_power,
+            rider
+        )
+
+    thermal_cost =
+        thermal_penalty(sys)
+
+    discomfort_cost =
+        discomfort_penalty(
+            braking_power,
+            rider
+        )
+
+    objective =
+        cfg.energy_weight * energy +
+        cfg.economic_weight * value -
+
+        cfg.rider_penalty_weight *
+        rider_cost -
+
+        cfg.fatigue_penalty_weight *
+        fatigue_cost -
+
+        cfg.thermal_penalty_weight *
+        thermal_cost -
+
+        cfg.discomfort_penalty_weight *
+        discomfort_cost
+
+    return (
+        objective,
+        energy,
+        value,
+        rider_cost,
+        fatigue_cost,
+        thermal_cost,
+        discomfort_cost
+    )
+
+end
+
+
+# ---------------------------------------------------------
+# Braking optimisation
+# ---------------------------------------------------------
+
+function optimise_braking(
+    rider::RiderState,
+    sys::SystemState,
+    econ::EconomicState,
+    cfg::OptimizerConfig;
+    horizon_minutes=1.0
+)
+
+    maximum =
+        min(
+            cfg.max_extra_resistance_w,
+            sys.max_generator_power_w
+        )
+
+    best_objective = -Inf
+    best_result = nothing
+
+    for braking in range(
+        0.0,
+        maximum,
+        length=cfg.optimisation_resolution
+    )
+
+        # Cadence protection
+        predicted_cadence =
+            rider.cadence_rpm -
+            0.08 * braking
+
+        if predicted_cadence <
+           cfg.min_cadence_rpm
+
+            continue
+
+        end
+
+        if predicted_cadence >
+           cfg.max_cadence_rpm
+
+            continue
+
+        end
+
+        result =
+            weighted_objective(
+                braking,
+                rider,
+                sys,
+                econ,
+                cfg,
+                horizon_minutes
+            )
+
+        (
+            objective,
+            energy,
+            value,
+            rider_cost,
+            fatigue_cost,
+            thermal_cost,
+            discomfort_cost
+        ) = result
+
+        if objective > best_objective
+
+            best_objective = objective
+
+            best_result =
+                OptimizationResult(
+                    braking,
+                    generated_power(
+                        braking,
+                        sys
+                    ),
+                    energy,
+                    value,
+                    rider_cost,
+                    fatigue_cost,
+                    thermal_cost,
+                    discomfort_cost,
+                    objective
+                )
+
+        end
+
+    end
+
+    return best_result
+
+end
+
+
+# ---------------------------------------------------------
+# Dynamic economic weighting
+# ---------------------------------------------------------
+
+function update_economics(
+    econ::EconomicState,
+    battery_soc::Float64
+)
+
+    # Higher value when stored electricity
+    # can directly displace grid consumption.
+
+    multiplier =
+        if battery_soc < 0.50
+            1.20
+        elseif battery_soc < 0.80
+            1.00
+        else
+            0.65
+        end
+
+    return EconomicState(
+        econ.electricity_price_gbp_kwh,
+        econ.export_price_gbp_kwh,
+        econ.grid_import_avoided,
+        multiplier
+    )
+
+end
+
+end
+
+
