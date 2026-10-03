@@ -1,0 +1,1313 @@
+```julia
+module LastOnePercentBatteryDrain
+
+using Statistics
+using Dates
+
+# ============================================================
+#  LAST 1% BATTERY DRAIN INTELLIGENCE
+#
+#  Julia layer for:
+#    - battery drain modelling
+#    - final-percent prediction
+#    - workload energy estimation
+#    - thermal-aware optimisation
+#    - drain-rate learning
+#    - emergency workload scheduling
+#
+#  Julia analyses and optimises.
+#  Swift/iOS remains responsible for actually applying
+#  device-level policies.
+# ============================================================
+
+
+# ------------------------------------------------------------
+# ENUMERATIONS
+# ------------------------------------------------------------
+
+@enum DrainState begin
+    NORMAL
+    LOW_BATTERY
+    FINAL_PERCENT
+    CRITICAL
+    EMERGENCY
+end
+
+@enum WorkloadType begin
+    IDLE_WORKLOAD
+    UI_RENDERING
+    NETWORK
+    CPU_COMPUTE
+    GPU_COMPUTE
+    CAMERA
+    AUDIO
+    LOCATION
+    SENSOR
+    BACKGROUND_SYNC
+    AI_INFERENCE
+    VIDEO_PLAYBACK
+end
+
+@enum PowerPriority begin
+    PERFORMANCE
+    BALANCED
+    EFFICIENCY
+    SURVIVAL
+end
+
+
+# ------------------------------------------------------------
+# BATTERY TELEMETRY
+# ------------------------------------------------------------
+
+struct BatterySample
+    timestamp::DateTime
+
+    battery_percent::Float64
+    voltage::Float64
+    temperature_c::Float64
+
+    cpu_load::Float64
+    gpu_load::Float64
+
+    screen_brightness::Float64
+    network_activity::Float64
+
+    charging::Bool
+    low_power_mode::Bool
+end
+
+
+struct Workload
+    name::String
+    workload_type::WorkloadType
+
+    cpu_load::Float64
+    gpu_load::Float64
+    network_load::Float64
+
+    sensor_load::Float64
+    display_load::Float64
+
+    duration_seconds::Float64
+end
+
+
+struct DrainPrediction
+    battery_percent::Float64
+    drain_percent_per_hour::Float64
+
+    estimated_minutes_remaining::Float64
+    estimated_seconds_remaining::Float64
+
+    confidence::Float64
+    state::DrainState
+end
+
+
+# ------------------------------------------------------------
+# DEVICE PROFILE
+# ------------------------------------------------------------
+
+struct DeviceBatteryProfile
+    capacity_wh::Float64
+
+    idle_power_w::Float64
+    display_power_w::Float64
+    cpu_power_w::Float64
+    gpu_power_w::Float64
+    network_power_w::Float64
+    sensor_power_w::Float64
+end
+
+
+# Example nominal profile.
+# Production systems should learn these values from telemetry.
+
+const DEFAULT_PROFILE = DeviceBatteryProfile(
+    14.0,   # capacity Wh
+    0.35,   # idle
+    1.5,    # display
+    3.0,    # CPU
+    4.5,    # GPU
+    0.8,    # network
+    0.4     # sensors
+)
+
+
+# ------------------------------------------------------------
+# BATTERY HISTORY
+# ------------------------------------------------------------
+
+mutable struct BatteryHistory
+    samples::Vector{BatterySample}
+
+    function BatteryHistory()
+        new(BatterySample[])
+    end
+end
+
+
+function add_sample!(
+    history::BatteryHistory,
+    sample::BatterySample
+)
+    push!(history.samples, sample)
+
+    # Keep a rolling history.
+    if length(history.samples) > 10_000
+        deleteat!(history.samples, 1)
+    end
+
+    return history
+end
+
+
+# ------------------------------------------------------------
+# DRAIN RATE
+# ------------------------------------------------------------
+
+function drain_rate_percent_per_hour(
+    history::BatteryHistory;
+    window_minutes::Float64 = 30.0
+)
+
+    samples = history.samples
+
+    length(samples) < 2 && return 0.0
+
+    newest = samples[end]
+    cutoff = newest.timestamp - Millisecond(round(Int, window_minutes * 60_000))
+
+    recent = filter(
+        s -> s.timestamp >= cutoff,
+        samples
+    )
+
+    length(recent) < 2 && return 0.0
+
+    first_sample = first(recent)
+    last_sample = last(recent)
+
+    elapsed_hours =
+        Dates.value(
+            last_sample.timestamp - first_sample.timestamp
+        ) / 3_600_000
+
+    elapsed_hours <= 0 && return 0.0
+
+    battery_drop =
+        first_sample.battery_percent -
+        last_sample.battery_percent
+
+    return max(
+        0.0,
+        battery_drop / elapsed_hours
+    )
+end
+
+
+# ------------------------------------------------------------
+# ROBUST DRAIN RATE
+# ------------------------------------------------------------
+
+function robust_drain_rate(
+    history::BatteryHistory
+)
+
+    samples = history.samples
+
+    length(samples) < 3 && return 0.0
+
+    rates = Float64[]
+
+    for i in 2:length(samples)
+
+        a = samples[i-1]
+        b = samples[i]
+
+        dt =
+            Dates.value(
+                b.timestamp - a.timestamp
+            ) / 3_600_000
+
+        dt <= 0 && continue
+
+        drop =
+            a.battery_percent -
+            b.battery_percent
+
+        rate = drop / dt
+
+        if rate >= 0
+            push!(rates, rate)
+        end
+    end
+
+    isempty(rates) && return 0.0
+
+    # Median is deliberately used instead of a mean:
+    # it is less sensitive to noisy battery percentage reports.
+    return median(rates)
+end
+
+
+# ------------------------------------------------------------
+# WORKLOAD POWER MODEL
+# ------------------------------------------------------------
+
+function workload_power(
+    workload::Workload,
+    profile::DeviceBatteryProfile
+)
+
+    cpu =
+        workload.cpu_load *
+        profile.cpu_power_w
+
+    gpu =
+        workload.gpu_load *
+        profile.gpu_power_w
+
+    network =
+        workload.network_load *
+        profile.network_power_w
+
+    sensors =
+        workload.sensor_load *
+        profile.sensor_power_w
+
+    display =
+        workload.display_load *
+        profile.display_power_w
+
+    return (
+        profile.idle_power_w +
+        cpu +
+        gpu +
+        network +
+        sensors +
+        display
+    )
+end
+
+
+# ------------------------------------------------------------
+# WORKLOAD ENERGY
+# ------------------------------------------------------------
+
+function workload_energy_wh(
+    workload::Workload,
+    profile::DeviceBatteryProfile
+)
+
+    power =
+        workload_power(
+            workload,
+            profile
+        )
+
+    hours =
+        workload.duration_seconds / 3600.0
+
+    return power * hours
+end
+
+
+# ------------------------------------------------------------
+# ENERGY COST AS BATTERY %
+# ------------------------------------------------------------
+
+function energy_to_battery_percent(
+    energy_wh::Float64,
+    profile::DeviceBatteryProfile
+)
+
+    return 100.0 *
+        energy_wh /
+        profile.capacity_wh
+end
+
+
+# ------------------------------------------------------------
+# BATTERY STATE
+# ------------------------------------------------------------
+
+function classify_state(
+    battery_percent::Float64
+)
+
+    if battery_percent <= 1.0
+        return EMERGENCY
+
+    elseif battery_percent <= 2.0
+        return CRITICAL
+
+    elseif battery_percent <= 5.0
+        return FINAL_PERCENT
+
+    elseif battery_percent <= 15.0
+        return LOW_BATTERY
+
+    else
+        return NORMAL
+    end
+end
+
+
+# ------------------------------------------------------------
+# PREDICT REMAINING TIME
+# ------------------------------------------------------------
+
+function predict_remaining_time(
+    battery_percent::Float64,
+    drain_rate::Float64
+)
+
+    drain_rate <= 0.001 &&
+        return Inf
+
+    hours =
+        battery_percent /
+        drain_rate
+
+    return hours * 3600.0
+end
+
+
+# ------------------------------------------------------------
+# BATTERY PREDICTION
+# ------------------------------------------------------------
+
+function predict_battery(
+    history::BatteryHistory
+)
+
+    isempty(history.samples) &&
+        error("No battery telemetry available.")
+
+    latest = history.samples[end]
+
+    rate =
+        robust_drain_rate(history)
+
+    seconds =
+        predict_remaining_time(
+            latest.battery_percent,
+            rate
+        )
+
+    state =
+        classify_state(
+            latest.battery_percent
+        )
+
+    confidence =
+        min(
+            1.0,
+            length(history.samples) / 100.0
+        )
+
+    return DrainPrediction(
+        latest.battery_percent,
+        rate,
+        seconds / 60.0,
+        seconds,
+        confidence,
+        state
+    )
+end
+
+
+# ------------------------------------------------------------
+# FINAL 1% MODEL
+# ------------------------------------------------------------
+
+struct FinalPercentModel
+    base_drain_rate::Float64
+    thermal_multiplier::Float64
+    cpu_multiplier::Float64
+    gpu_multiplier::Float64
+    network_multiplier::Float64
+end
+
+
+function build_final_percent_model(
+    sample::BatterySample,
+    history::BatteryHistory
+)
+
+    base =
+        robust_drain_rate(history)
+
+    thermal =
+        if sample.temperature_c < 35
+            1.0
+        elseif sample.temperature_c < 40
+            1.10
+        elseif sample.temperature_c < 45
+            1.25
+        else
+            1.50
+        end
+
+    cpu =
+        1.0 + sample.cpu_load * 0.50
+
+    gpu =
+        1.0 + sample.gpu_load * 0.75
+
+    network =
+        1.0 + sample.network_activity * 0.25
+
+    return FinalPercentModel(
+        base,
+        thermal,
+        cpu,
+        gpu,
+        network
+    )
+end
+
+
+function final_percent_drain_rate(
+    model::FinalPercentModel
+)
+
+    return model.base_drain_rate *
+        model.thermal_multiplier *
+        model.cpu_multiplier *
+        model.gpu_multiplier *
+        model.network_multiplier
+end
+
+
+# ------------------------------------------------------------
+# TIME UNTIL 1%
+# ------------------------------------------------------------
+
+function time_until_one_percent(
+    battery_percent::Float64,
+    drain_rate::Float64
+)
+
+    battery_percent <= 1.0 &&
+        return 0.0
+
+    drain_rate <= 0 &&
+        return Inf
+
+    hours =
+        (battery_percent - 1.0) /
+        drain_rate
+
+    return hours * 3600.0
+end
+
+
+# ------------------------------------------------------------
+# WORKLOAD SURVIVAL TEST
+# ------------------------------------------------------------
+
+function workload_survival_test(
+    battery_percent::Float64,
+    workload::Workload,
+    profile::DeviceBatteryProfile
+)
+
+    energy =
+        workload_energy_wh(
+            workload,
+            profile
+        )
+
+    battery_cost =
+        energy_to_battery_percent(
+            energy,
+            profile
+        )
+
+    remaining =
+        battery_percent -
+        battery_cost
+
+    return (
+        battery_cost = battery_cost,
+        remaining_percent = max(0.0, remaining),
+        survives = remaining > 0.5
+    )
+end
+
+
+# ------------------------------------------------------------
+# WORKLOAD OPTIMISATION
+# ------------------------------------------------------------
+
+struct WorkloadDecision
+    workload::Workload
+
+    energy_wh::Float64
+    battery_cost_percent::Float64
+
+    allowed::Bool
+    priority::PowerPriority
+
+    reason::String
+end
+
+
+function optimise_workload(
+    battery_percent::Float64,
+    workload::Workload,
+    profile::DeviceBatteryProfile
+)
+
+    test =
+        workload_survival_test(
+            battery_percent,
+            workload,
+            profile
+        )
+
+    state =
+        classify_state(
+            battery_percent
+        )
+
+    if state == NORMAL
+
+        return WorkloadDecision(
+            workload,
+            workload_energy_wh(workload, profile),
+            test.battery_cost,
+            true,
+            PERFORMANCE,
+            "Normal battery operation."
+        )
+
+    elseif state == LOW_BATTERY
+
+        allowed =
+            test.battery_cost < 5.0
+
+        return WorkloadDecision(
+            workload,
+            workload_energy_wh(workload, profile),
+            test.battery_cost,
+            allowed,
+            EFFICIENCY,
+            allowed ?
+                "Allowed under low-battery efficiency policy." :
+                "Workload consumes too much battery."
+        )
+
+    elseif state == FINAL_PERCENT
+
+        allowed =
+            test.battery_cost < 0.5
+
+        return WorkloadDecision(
+            workload,
+            workload_energy_wh(workload, profile),
+            test.battery_cost,
+            allowed,
+            SURVIVAL,
+            allowed ?
+                "Small workload permitted during final battery stage." :
+                "Deferred until charging."
+        )
+
+    elseif state == CRITICAL
+
+        allowed =
+            workload.workload_type in (
+                IDLE_WORKLOAD,
+                UI_RENDERING,
+                AUDIO
+            )
+
+        return WorkloadDecision(
+            workload,
+            workload_energy_wh(workload, profile),
+            test.battery_cost,
+            allowed,
+            SURVIVAL,
+            allowed ?
+                "Essential low-energy workload." :
+                "Critical battery state."
+        )
+
+    else
+
+        return WorkloadDecision(
+            workload,
+            workload_energy_wh(workload, profile),
+            test.battery_cost,
+            workload.workload_type == IDLE_WORKLOAD,
+            SURVIVAL,
+            workload.workload_type == IDLE_WORKLOAD ?
+                "Emergency idle workload." :
+                "Emergency battery preservation."
+        )
+    end
+end
+
+
+# ------------------------------------------------------------
+# RANK WORKLOADS BY ENERGY COST
+# ------------------------------------------------------------
+
+function rank_workloads(
+    workloads::Vector{Workload},
+    profile::DeviceBatteryProfile
+)
+
+    ranked =
+        sort(
+            workloads,
+            by = w ->
+                workload_energy_wh(w, profile)
+        )
+
+    return ranked
+end
+
+
+# ------------------------------------------------------------
+# ENERGY SAVING OPPORTUNITIES
+# ------------------------------------------------------------
+
+struct EnergyOpportunity
+    workload_type::WorkloadType
+    estimated_saving_percent::Float64
+    action::String
+end
+
+
+function energy_opportunities(
+    battery_percent::Float64
+)
+
+    state =
+        classify_state(battery_percent)
+
+    opportunities = EnergyOpportunity[]
+
+    if state in (FINAL_PERCENT, CRITICAL, EMERGENCY)
+
+        push!(
+            opportunities,
+            EnergyOpportunity(
+                GPU_COMPUTE,
+                4.0,
+                "Defer GPU-intensive workloads."
+            )
+        )
+
+        push!(
+            opportunities,
+            EnergyOpportunity(
+                AI_INFERENCE,
+                3.0,
+                "Use cached or reduced-compute inference."
+            )
+        )
+
+        push!(
+            opportunities,
+            EnergyOpportunity(
+                NETWORK,
+                2.0,
+                "Batch network requests."
+            )
+        )
+
+        push!(
+            opportunities,
+            EnergyOpportunity(
+                SENSOR,
+                1.5,
+                "Reduce sensor sampling frequency."
+            )
+        )
+
+        push!(
+            opportunities,
+            EnergyOpportunity(
+                BACKGROUND_SYNC,
+                2.5,
+                "Suspend non-essential background synchronisation."
+            )
+        )
+    end
+
+    return opportunities
+end
+
+
+# ------------------------------------------------------------
+# FINAL 1% SURVIVAL STRATEGY
+# ------------------------------------------------------------
+
+struct SurvivalStrategy
+    battery_percent::Float64
+
+    reduce_display::Bool
+    reduce_network::Bool
+    reduce_sensors::Bool
+    reduce_ai::Bool
+    reduce_gpu::Bool
+    suspend_background::Bool
+
+    target_power_w::Float64
+end
+
+
+function survival_strategy(
+    battery_percent::Float64
+)
+
+    if battery_percent > 5.0
+
+        return SurvivalStrategy(
+            battery_percent,
+            false,
+            false,
+            false,
+            false,
+            false,
+            NaN
+        )
+
+    elseif battery_percent > 2.0
+
+        return SurvivalStrategy(
+            battery_percent,
+            true,
+            true,
+            true,
+            true,
+            true,
+            1.0
+        )
+
+    elseif battery_percent > 1.0
+
+        return SurvivalStrategy(
+            battery_percent,
+            true,
+            true,
+            true,
+            true,
+            true,
+            0.65
+        )
+
+    else
+
+        return SurvivalStrategy(
+            battery_percent,
+            true,
+            true,
+            true,
+            true,
+            true,
+            0.35
+        )
+    end
+end
+
+
+# ------------------------------------------------------------
+# DRAIN SIMULATION
+# ------------------------------------------------------------
+
+function simulate_drain(
+    starting_percent::Float64,
+    workload::Workload,
+    profile::DeviceBatteryProfile;
+    timestep_seconds::Float64 = 60.0
+)
+
+    battery = starting_percent
+    elapsed = 0.0
+
+    power =
+        workload_power(
+            workload,
+            profile
+        )
+
+    while battery > 0
+
+        energy =
+            power *
+            timestep_seconds /
+            3600.0
+
+        drop =
+            energy_to_battery_percent(
+                energy,
+                profile
+            )
+
+        battery -= drop
+
+        elapsed += timestep_seconds
+
+        elapsed > 86_400 && break
+    end
+
+    return (
+        final_battery = max(0.0, battery),
+        elapsed_seconds = elapsed,
+        elapsed_minutes = elapsed / 60.0
+    )
+end
+
+
+# ------------------------------------------------------------
+# ADAPTIVE FINAL-PERCENT SIMULATION
+# ------------------------------------------------------------
+
+function adaptive_final_percent_simulation(
+    starting_percent::Float64,
+    profile::DeviceBatteryProfile;
+    timestep_seconds::Float64 = 60.0
+)
+
+    battery = starting_percent
+    elapsed = 0.0
+
+    history = Float64[]
+
+    while battery > 0.0
+
+        strategy =
+            survival_strategy(
+                battery
+            )
+
+        power =
+            if isnan(strategy.target_power_w)
+                2.0
+            else
+                strategy.target_power_w
+            end
+
+        energy =
+            power *
+            timestep_seconds /
+            3600.0
+
+        drop =
+            energy_to_battery_percent(
+                energy,
+                profile
+            )
+
+        battery =
+            max(
+                0.0,
+                battery - drop
+            )
+
+        elapsed += timestep_seconds
+
+        push!(
+            history,
+            battery
+        )
+
+        elapsed > 86_400 && break
+    end
+
+    return (
+        duration_minutes = elapsed / 60.0,
+        battery_curve = history
+    )
+end
+
+
+# ------------------------------------------------------------
+# LEARNING MODEL
+# ------------------------------------------------------------
+
+mutable struct DrainLearningModel
+
+    observed_rates::Vector{Float64}
+
+    cpu_coefficients::Vector{Float64}
+    gpu_coefficients::Vector{Float64}
+    network_coefficients::Vector{Float64}
+
+end
+
+
+function DrainLearningModel()
+
+    DrainLearningModel(
+        Float64[],
+        Float64[],
+        Float64[]
+    )
+end
+
+
+function learn!(
+    model::DrainLearningModel,
+    history::BatteryHistory
+)
+
+    rate =
+        robust_drain_rate(history)
+
+    rate > 0 &&
+        push!(
+            model.observed_rates,
+            rate
+        )
+
+    if length(model.observed_rates) > 500
+        deleteat!(
+            model.observed_rates,
+            1
+        )
+    end
+
+    return model
+end
+
+
+function learned_drain_rate(
+    model::DrainLearningModel
+)
+
+    isempty(model.observed_rates) &&
+        return 0.0
+
+    return median(
+        model.observed_rates
+    )
+end
+
+
+# ------------------------------------------------------------
+# COMPLETE BATTERY ANALYSIS
+# ------------------------------------------------------------
+
+struct BatteryAnalysis
+    prediction::DrainPrediction
+    final_model::FinalPercentModel
+    strategy::SurvivalStrategy
+    opportunities::Vector{EnergyOpportunity}
+end
+
+
+function analyse_battery(
+    history::BatteryHistory
+)
+
+    prediction =
+        predict_battery(
+            history
+        )
+
+    latest =
+        history.samples[end]
+
+    final_model =
+        build_final_percent_model(
+            latest,
+            history
+        )
+
+    strategy =
+        survival_strategy(
+            latest.battery_percent
+        )
+
+    opportunities =
+        energy_opportunities(
+            latest.battery_percent
+        )
+
+    return BatteryAnalysis(
+        prediction,
+        final_model,
+        strategy,
+        opportunities
+    )
+end
+
+
+# ------------------------------------------------------------
+# REPORT
+# ------------------------------------------------------------
+
+function print_report(
+    analysis::BatteryAnalysis
+)
+
+    p = analysis.prediction
+    m = analysis.final_model
+    s = analysis.strategy
+
+    println()
+    println("==============================================")
+    println("      LAST 1% BATTERY INTELLIGENCE")
+    println("==============================================")
+
+    println(
+        "Battery: ",
+        round(p.battery_percent, digits=2),
+        "%"
+    )
+
+    println(
+        "State: ",
+        p.state
+    )
+
+    println(
+        "Observed drain: ",
+        round(
+            p.drain_percent_per_hour,
+            digits=3
+        ),
+        "% / hour"
+    )
+
+    println(
+        "Estimated remaining: ",
+        round(
+            p.estimated_minutes_remaining,
+            digits=1
+        ),
+        " minutes"
+    )
+
+    println(
+        "Prediction confidence: ",
+        round(
+            p.confidence * 100,
+            digits=1
+        ),
+        "%"
+    )
+
+    println()
+    println("FINAL-PERCENT MODEL")
+    println(
+        "Thermal multiplier: ",
+        round(
+            m.thermal_multiplier,
+            digits=2
+        )
+    )
+
+    println(
+        "CPU multiplier: ",
+        round(
+            m.cpu_multiplier,
+            digits=2
+        )
+    )
+
+    println(
+        "GPU multiplier: ",
+        round(
+            m.gpu_multiplier,
+            digits=2
+        )
+    )
+
+    println(
+        "Network multiplier: ",
+        round(
+            m.network_multiplier,
+            digits=2
+        )
+    )
+
+    println()
+    println("SURVIVAL POLICY")
+
+    println(
+        "Display reduction: ",
+        s.reduce_display
+    )
+
+    println(
+        "Network reduction: ",
+        s.reduce_network
+    )
+
+    println(
+        "Sensor reduction: ",
+        s.reduce_sensors
+    )
+
+    println(
+        "AI reduction: ",
+        s.reduce_ai
+    )
+
+    println(
+        "GPU reduction: ",
+        s.reduce_gpu
+    )
+
+    println(
+        "Background suspension: ",
+        s.suspend_background
+    )
+
+    println(
+        "Target power: ",
+        s.target_power_w,
+        " W"
+    )
+
+    println()
+    println("==============================================")
+end
+
+
+# ------------------------------------------------------------
+# DEMO TELEMETRY
+# ------------------------------------------------------------
+
+function demo_history()
+
+    history =
+        BatteryHistory()
+
+    start =
+        DateTime(2026, 10, 3, 10, 0, 0)
+
+    for i in 0:30
+
+        timestamp =
+            start +
+            Minute(i)
+
+        battery =
+            5.0 -
+            i * 0.12
+
+        sample =
+            BatterySample(
+                timestamp,
+                max(battery, 1.0),
+                3.8,
+                0.25,
+                0.10,
+                0.55,
+                0.30,
+                0.25,
+                false,
+                true
+            )
+
+        add_sample!(
+            history,
+            sample
+        )
+    end
+
+    return history
+end
+
+
+# ------------------------------------------------------------
+# DEMO
+# ------------------------------------------------------------
+
+function demo()
+
+    history =
+        demo_history()
+
+    analysis =
+        analyse_battery(
+            history
+        )
+
+    print_report(
+        analysis
+    )
+
+    profile =
+        DEFAULT_PROFILE
+
+    workload =
+        Workload(
+            "AI background inference",
+            AI_INFERENCE,
+            0.70,
+            0.45,
+            0.10,
+            0.05,
+            0.60,
+            300.0
+        )
+
+    decision =
+        optimise_workload(
+            1.2,
+            workload,
+            profile
+        )
+
+    println()
+    println("WORKLOAD TEST")
+    println(
+        "Workload: ",
+        workload.name
+    )
+
+    println(
+        "Battery cost: ",
+        round(
+            decision.battery_cost_percent,
+            digits=3
+        ),
+        "%"
+    )
+
+    println(
+        "Allowed: ",
+        decision.allowed
+    )
+
+    println(
+        "Reason: ",
+        decision.reason
+    )
+
+    println()
+
+    simulation =
+        adaptive_final_percent_simulation(
+            1.0,
+            profile
+        )
+
+    println(
+        "Adaptive final-1% simulation: ",
+        round(
+            simulation.duration_minutes,
+            digits=1
+        ),
+        " minutes"
+    )
+
+    return analysis
+end
+
+
+end # module
+```
+
+
