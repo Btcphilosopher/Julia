@@ -540,3 +540,296 @@ dianjia_minganxing_fenxi(
 touzi_zuhe_tongji(
     heyue_liebiao
 )
+
+
+
+
+
+
+
+# ============================================================
+# Electricity Strike Price Analysis System
+# Electricity Options / Power Contracts
+# Julia
+# ============================================================
+
+using Printf
+using Statistics
+
+# ------------------------------------------------------------
+# Electricity Contract
+# ------------------------------------------------------------
+
+struct ElectricityContract
+    name::String
+    strike_price::Float64       # currency/MWh
+    market_price::Float64       # currency/MWh
+    capacity_mw::Float64        # MW
+    contract_hours::Float64
+    option_type::Symbol         # :call or :put
+end
+
+# ------------------------------------------------------------
+# Calculate Intrinsic Value
+# ------------------------------------------------------------
+
+function intrinsic_value(contract::ElectricityContract)
+
+    if contract.option_type == :call
+
+        return max(
+            contract.market_price - contract.strike_price,
+            0.0
+        )
+
+    elseif contract.option_type == :put
+
+        return max(
+            contract.strike_price - contract.market_price,
+            0.0
+        )
+
+    else
+        error("Unknown option type")
+    end
+end
+
+# ------------------------------------------------------------
+# Calculate Total Contract Value
+# ------------------------------------------------------------
+
+function contract_value(contract::ElectricityContract)
+
+    value_per_mwh =
+        intrinsic_value(contract)
+
+    total_energy =
+        contract.capacity_mw *
+        contract.contract_hours
+
+    return value_per_mwh * total_energy
+end
+
+# ------------------------------------------------------------
+# Determine Whether Option Should Be Exercised
+# ------------------------------------------------------------
+
+function should_exercise(contract::ElectricityContract)
+
+    if contract.option_type == :call
+
+        return contract.market_price >
+               contract.strike_price
+
+    elseif contract.option_type == :put
+
+        return contract.market_price <
+               contract.strike_price
+    end
+
+    return false
+end
+
+# ------------------------------------------------------------
+# Electricity Price Sensitivity Analysis
+# ------------------------------------------------------------
+
+function price_sensitivity(
+    strike_price::Float64,
+    market_prices::Vector{Float64},
+    option_type::Symbol
+)
+
+    println()
+    println("==============================================")
+    println("Electricity Strike Price Sensitivity Analysis")
+    println("==============================================")
+
+    for market_price in market_prices
+
+        if option_type == :call
+
+            payoff = max(
+                market_price - strike_price,
+                0.0
+            )
+
+        elseif option_type == :put
+
+            payoff = max(
+                strike_price - market_price,
+                0.0
+            )
+
+        else
+            error("Unknown option type")
+        end
+
+        @printf(
+            "Market Price: %8.2f /MWh | Intrinsic Value: %8.2f /MWh\n",
+            market_price,
+            payoff
+        )
+    end
+end
+
+# ------------------------------------------------------------
+# Portfolio Statistics
+# ------------------------------------------------------------
+
+function portfolio_statistics(
+    contracts::Vector{ElectricityContract}
+)
+
+    total_value = 0.0
+    exercisable_contracts = 0
+
+    for contract in contracts
+
+        value = contract_value(contract)
+
+        total_value += value
+
+        if should_exercise(contract)
+            exercisable_contracts += 1
+        end
+    end
+
+    println()
+    println("==============================================")
+    println("Electricity Portfolio Statistics")
+    println("==============================================")
+
+    @printf(
+        "Number of contracts: %d\n",
+        length(contracts)
+    )
+
+    @printf(
+        "Currently exercisable: %d\n",
+        exercisable_contracts
+    )
+
+    @printf(
+        "Portfolio intrinsic value: %.2f\n",
+        total_value
+    )
+
+    return total_value
+end
+
+# ------------------------------------------------------------
+# Create Electricity Contracts
+# ------------------------------------------------------------
+
+contract_1 = ElectricityContract(
+    "Eastern Grid Baseload",
+    420.0,
+    510.0,
+    100.0,
+    24.0,
+    :call
+)
+
+contract_2 = ElectricityContract(
+    "Northern Peak Power",
+    680.0,
+    620.0,
+    50.0,
+    6.0,
+    :put
+)
+
+contract_3 = ElectricityContract(
+    "Southern Power",
+    450.0,
+    470.0,
+    80.0,
+    12.0,
+    :call
+)
+
+contracts = [
+    contract_1,
+    contract_2,
+    contract_3
+]
+
+# ------------------------------------------------------------
+# Display Contracts
+# ------------------------------------------------------------
+
+println("╔══════════════════════════════════════════════╗")
+println("║       ELECTRICITY STRIKE PRICE SYSTEM        ║")
+println("╚══════════════════════════════════════════════╝")
+
+for contract in contracts
+
+    intrinsic = intrinsic_value(contract)
+
+    total_value =
+        contract_value(contract)
+
+    exercise =
+        should_exercise(contract)
+
+    println()
+    println("Contract: ", contract.name)
+
+    println(
+        "Strike price: ",
+        contract.strike_price,
+        " /MWh"
+    )
+
+    println(
+        "Market price: ",
+        contract.market_price,
+        " /MWh"
+    )
+
+    println(
+        "Capacity: ",
+        contract.capacity_mw,
+        " MW"
+    )
+
+    println(
+        "Option type: ",
+        contract.option_type
+    )
+
+    @printf(
+        "Intrinsic value: %.2f /MWh\n",
+        intrinsic
+    )
+
+    @printf(
+        "Contract value: %.2f\n",
+        total_value
+    )
+
+    println(
+        "Exercise status: ",
+        exercise ?
+        "EXERCISE" :
+        "DO NOT EXERCISE"
+    )
+end
+
+# ------------------------------------------------------------
+# Strike Price Sensitivity
+# ------------------------------------------------------------
+
+price_sensitivity(
+    420.0,
+    collect(200.0:50.0:800.0),
+    :call
+)
+
+# ------------------------------------------------------------
+# Portfolio Analysis
+# ------------------------------------------------------------
+
+portfolio_statistics(contracts)
+
