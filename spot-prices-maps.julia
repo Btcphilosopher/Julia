@@ -1,0 +1,106 @@
+struct PetrolStation
+    name::String
+    latitude::Float64
+    longitude::Float64
+    price_per_litre::Float64
+end
+
+struct Vehicle
+    fuel_consumption_l_per_100km::Float64
+    tank_capacity_l::Float64
+end
+
+struct StationResult
+    station::PetrolStation
+    driving_distance_km::Float64
+    driving_time_min::Float64
+    fuel_used_to_reach_l::Float64
+    driving_cost::Float64
+    fuel_purchase_cost::Float64
+    total_cost::Float64
+    effective_price_per_litre::Float64
+end
+
+
+
+
+function calculate_station_cost(
+    station::PetrolStation,
+    distance_km::Float64,
+    duration_min::Float64,
+    vehicle::Vehicle,
+    litres_to_buy::Float64
+)
+
+    # Fuel consumed travelling to station
+    fuel_used =
+        distance_km *
+        vehicle.fuel_consumption_l_per_100km / 100.0
+
+    # Cost of fuel consumed getting there
+    driving_cost =
+        fuel_used * station.price_per_litre
+
+    # Cost of fuel purchased
+    purchase_cost =
+        litres_to_buy * station.price_per_litre
+
+    # Total economic cost
+    total_cost =
+        driving_cost + purchase_cost
+
+    # Effective price including detour
+    effective_price =
+        total_cost / litres_to_buy
+
+    return StationResult(
+        station,
+        distance_km,
+        duration_min,
+        fuel_used,
+        driving_cost,
+        purchase_cost,
+        total_cost,
+        effective_price
+    )
+end
+
+
+
+
+
+
+
+function optimise_stations(
+    stations,
+    distances,
+    durations,
+    vehicle,
+    litres_to_buy
+)
+
+    results = StationResult[]
+
+    for i in eachindex(stations)
+
+        result = calculate_station_cost(
+            stations[i],
+            distances[i],
+            durations[i],
+            vehicle,
+            litres_to_buy
+        )
+
+        push!(results, result)
+    end
+
+    sort!(
+        results,
+        by = x -> x.total_cost
+    )
+
+    return results
+end
+
+
+
