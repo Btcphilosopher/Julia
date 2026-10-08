@@ -1,0 +1,1311 @@
+```julia
+# conveyor.jl
+#
+# Conveyor Belt Control + Optimisation System
+# Julia 1.x
+#
+# Features:
+#   - Belt speed control
+#   - Variable load
+#   - Motor torque estimation
+#   - Power consumption
+#   - Throughput calculation
+#   - Acceleration/deceleration limits
+#   - Jam detection
+#   - Emergency stopping
+#   - Automatic energy optimisation
+#   - Multi-zone conveyor support
+
+module ConveyorControl
+
+export Conveyor, Motor, Load, ConveyorController,
+       update!, emergency_stop!, optimise_speed!,
+       conveyor_status
+
+# ---------------------------------------------------------
+# Physical components
+# ---------------------------------------------------------
+
+mutable struct Motor
+    rated_power_kw::Float64
+    max_torque_nm::Float64
+    efficiency::Float64
+    temperature::Float64
+end
+
+mutable struct Load
+    mass_kg::Float64
+    position_m::Float64
+    length_m::Float64
+end
+
+mutable struct Conveyor
+    length_m::Float64
+    belt_speed_ms::Float64
+    target_speed_ms::Float64
+
+    max_speed_ms::Float64
+    max_acceleration_ms2::Float64
+    max_deceleration_ms2::Float64
+
+    belt_mass_kg::Float64
+    friction_coefficient::Float64
+
+    motor::Motor
+    loads::Vector{Load}
+
+    running::Bool
+    emergency::Bool
+    jam_detected::Bool
+
+    energy_kwh::Float64
+    throughput_kg_s::Float64
+end
+
+# ---------------------------------------------------------
+# Controller
+# ---------------------------------------------------------
+
+mutable struct ConveyorController
+    kp::Float64
+    ki::Float64
+    kd::Float64
+
+    integral::Float64
+    previous_error::Float64
+
+    energy_target_kw::Float64
+end
+
+
+# ---------------------------------------------------------
+# Constructor
+# ---------------------------------------------------------
+
+function Conveyor(
+    length_m;
+    max_speed_ms = 3.0,
+    max_acceleration_ms2 = 0.5,
+    max_deceleration_ms2 = 0.8,
+    belt_mass_kg = 500.0,
+    friction_coefficient = 0.03
+)
+
+    motor = Motor(
+        75.0,       # kW
+        1200.0,     # Nm
+        0.94,
+        25.0
+    )
+
+    return Conveyor(
+        length_m,
+        0.0,
+        0.0,
+        max_speed_ms,
+        max_acceleration_ms2,
+        max_deceleration_ms2,
+        belt_mass_kg,
+        friction_coefficient,
+        motor,
+        Load[],
+        false,
+        false,
+        false,
+        0.0,
+        0.0
+    )
+end
+
+
+# ---------------------------------------------------------
+# Add material to conveyor
+# ---------------------------------------------------------
+
+function add_load!(
+    conveyor::Conveyor,
+    mass_kg;
+    position_m = 0.0,
+    length_m = 0.5
+)
+
+    push!(
+        conveyor.loads,
+        Load(
+            mass_kg,
+            position_m,
+            length_m
+        )
+    )
+end
+
+
+# ---------------------------------------------------------
+# Total mass on conveyor
+# ---------------------------------------------------------
+
+function total_mass(c::Conveyor)
+
+    return c.belt_mass_kg +
+           sum(load.mass_kg for load in c.loads)
+
+end
+
+
+# ---------------------------------------------------------
+# Conveyor throughput
+# ---------------------------------------------------------
+
+function calculate_throughput(c::Conveyor)
+
+    if isempty(c.loads)
+        return 0.0
+    end
+
+    mass = sum(load.mass_kg for load in c.loads)
+
+    loading_density =
+        mass / max(c.length_m, 1.0)
+
+    return loading_density * c.belt_speed_ms
+
+end
+
+
+# ---------------------------------------------------------
+# Motor force calculation
+# ---------------------------------------------------------
+
+function required_force(c::Conveyor)
+
+    mass = total_mass(c)
+
+    friction =
+        mass *
+        9.81 *
+        c.friction_coefficient
+
+    acceleration_force =
+        mass *
+        0.0
+
+    return friction + acceleration_force
+
+end
+
+
+# ---------------------------------------------------------
+# Motor power
+# ---------------------------------------------------------
+
+function calculate_power(c::Conveyor)
+
+    force = required_force(c)
+
+    mechanical_power =
+        force *
+        c.belt_speed_ms
+
+    electrical_power =
+        mechanical_power /
+        max(c.motor.efficiency, 0.01)
+
+    return electrical_power / 1000.0
+
+end
+
+
+# ---------------------------------------------------------
+# PID speed controller
+# ---------------------------------------------------------
+
+function speed_controller!(
+    controller::ConveyorController,
+    conveyor::Conveyor,
+    dt
+)
+
+    error =
+        conveyor.target_speed_ms -
+        conveyor.belt_speed_ms
+
+    controller.integral +=
+        error * dt
+
+    derivative =
+        (error - controller.previous_error) /
+        max(dt, 1e-6)
+
+    output =
+        controller.kp * error +
+        controller.ki * controller.integral +
+        controller.kd * derivative
+
+    controller.previous_error = error
+
+    return output
+
+end
+
+
+# ---------------------------------------------------------
+# Speed optimisation
+# ---------------------------------------------------------
+
+function optimise_speed!(
+    c::Conveyor;
+    desired_throughput = 100.0
+)
+
+    current_throughput =
+        calculate_throughput(c)
+
+    if current_throughput < desired_throughput
+
+        c.target_speed_ms =
+            min(
+                c.target_speed_ms + 0.1,
+                c.max_speed_ms
+            )
+
+    elseif current_throughput >
+           desired_throughput * 1.15
+
+        # Reduce speed to save energy
+
+        c.target_speed_ms =
+            max(
+                c.target_speed_ms - 0.1,
+                0.2
+            )
+    end
+
+end
+
+
+# ---------------------------------------------------------
+# Jam detection
+# ---------------------------------------------------------
+
+function detect_jam(c::Conveyor)
+
+    if isempty(c.loads)
+        return false
+    end
+
+    # Detect excessive overlapping loads
+
+    sorted_loads =
+        sort(
+            c.loads,
+            by = x -> x.position_m
+        )
+
+    for i in 1:length(sorted_loads)-1
+
+        a = sorted_loads[i]
+        b = sorted_loads[i+1]
+
+        if a.position_m + a.length_m >
+           b.position_m
+
+            return true
+        end
+    end
+
+    return false
+end
+
+
+# ---------------------------------------------------------
+# Emergency stop
+# ---------------------------------------------------------
+
+function emergency_stop!(c::Conveyor)
+
+    c.emergency = true
+    c.running = false
+    c.target_speed_ms = 0.0
+
+end
+
+
+# ---------------------------------------------------------
+# Start conveyor
+# ---------------------------------------------------------
+
+function start!(c::Conveyor)
+
+    if !c.emergency
+
+        c.running = true
+
+    end
+
+end
+
+
+# ---------------------------------------------------------
+# Update conveyor simulation
+# ---------------------------------------------------------
+
+function update!(
+    c::Conveyor,
+    controller::ConveyorController,
+    dt
+)
+
+    # ---------------------------------------------
+    # Safety
+    # ---------------------------------------------
+
+    if c.emergency
+
+        c.belt_speed_ms =
+            max(
+                c.belt_speed_ms -
+                c.max_deceleration_ms2 * dt,
+                0.0
+            )
+
+        return
+    end
+
+
+    # ---------------------------------------------
+    # Jam detection
+    # ---------------------------------------------
+
+    c.jam_detected =
+        detect_jam(c)
+
+    if c.jam_detected
+
+        emergency_stop!(c)
+
+        return
+    end
+
+
+    # ---------------------------------------------
+    # Controller
+    # ---------------------------------------------
+
+    control =
+        speed_controller!(
+            controller,
+            c,
+            dt
+        )
+
+
+    # ---------------------------------------------
+    # Apply acceleration limits
+    # ---------------------------------------------
+
+    desired_change =
+        control * dt
+
+    max_up =
+        c.max_acceleration_ms2 * dt
+
+    max_down =
+        c.max_deceleration_ms2 * dt
+
+    if desired_change > max_up
+
+        desired_change = max_up
+
+    elseif desired_change < -max_down
+
+        desired_change = -max_down
+
+    end
+
+
+    c.belt_speed_ms +=
+        desired_change
+
+
+    # Clamp speed
+
+    c.belt_speed_ms =
+        clamp(
+            c.belt_speed_ms,
+            0.0,
+            c.max_speed_ms
+        )
+
+
+    # ---------------------------------------------
+    # Move loads
+    # ---------------------------------------------
+
+    for load in c.loads
+
+        load.position_m +=
+            c.belt_speed_ms * dt
+
+    end
+
+
+    # ---------------------------------------------
+    # Remove loads that have left conveyor
+    # ---------------------------------------------
+
+    filter!(
+        load ->
+            load.position_m <
+            c.length_m,
+        c.loads
+    )
+
+
+    # ---------------------------------------------
+    # Throughput
+    # ---------------------------------------------
+
+    c.throughput_kg_s =
+        calculate_throughput(c)
+
+
+    # ---------------------------------------------
+    # Energy
+    # ---------------------------------------------
+
+    power_kw =
+        calculate_power(c)
+
+    c.energy_kwh +=
+        power_kw * dt / 3600.0
+
+
+    # ---------------------------------------------
+    # Motor temperature model
+    # ---------------------------------------------
+
+    temperature_rise =
+        power_kw /
+        max(c.motor.rated_power_kw, 1.0) *
+        0.05
+
+    cooling =
+        (c.motor.temperature - 25.0) *
+        0.01
+
+    c.motor.temperature +=
+        temperature_rise -
+        cooling
+
+end
+
+
+# ---------------------------------------------------------
+# Status reporting
+# ---------------------------------------------------------
+
+function conveyor_status(c::Conveyor)
+
+    return (
+        running = c.running,
+        emergency = c.emergency,
+        jam = c.jam_detected,
+
+        speed_ms =
+            c.belt_speed_ms,
+
+        target_speed_ms =
+            c.target_speed_ms,
+
+        throughput_kg_s =
+            c.throughput_kg_s,
+
+        power_kw =
+            calculate_power(c),
+
+        energy_kwh =
+            c.energy_kwh,
+
+        motor_temperature =
+            c.motor.temperature,
+
+        load_count =
+            length(c.loads)
+    )
+
+end
+
+end # module
+
+
+# =========================================================
+# Example application
+# =========================================================
+
+using .ConveyorControl
+
+conveyor =
+    Conveyor(
+        50.0;
+        max_speed_ms = 4.0,
+        max_acceleration_ms2 = 0.4
+    )
+
+controller =
+    ConveyorController(
+        2.0,      # Kp
+        0.15,     # Ki
+        0.05,     # Kd
+        0.0,
+        0.0,
+        60.0      # energy target
+    )
+
+
+# Add material
+
+add_load!(
+    conveyor,
+    100.0;
+    position_m = 2.0,
+    length_m = 1.0
+)
+
+add_load!(
+    conveyor,
+    80.0;
+    position_m = 8.0,
+    length_m = 0.8
+)
+
+add_load!(
+    conveyor,
+    120.0;
+    position_m = 15.0,
+    length_m = 1.2
+)
+
+
+# Start system
+
+start!(conveyor)
+
+conveyor.target_speed_ms = 2.5
+
+
+# ---------------------------------------------------------
+# Main control loop
+# ---------------------------------------------------------
+
+dt = 0.01
+
+for step in 1:10000
+
+    optimise_speed!(
+        conveyor;
+        desired_throughput = 100.0
+    )
+
+    update!(
+        conveyor,
+        controller,
+        dt
+    )
+
+    # Print status every second
+
+    if step % 100 == 0
+
+        status =
+            conveyor_status(conveyor)
+
+        println(
+            "t=$(round(step*dt,digits=1))s | ",
+            "speed=$(round(status.speed_ms,digits=2)) m/s | ",
+            "power=$(round(status.power_kw,digits=2)) kW | ",
+            "load=$(status.load_count) | ",
+            "temp=$(round(status.motor_temperature,digits=1))°C"
+        )
+    end
+
+end
+```
+
+
+
+
+
+
+
+
+
+```julia
+module ConveyorRobotCoordinator
+
+using LinearAlgebra
+
+# ============================================================
+# ITEM
+# ============================================================
+
+mutable struct Item
+    id::Int
+
+    # Conveyor coordinates
+    x::Float64
+    y::Float64
+    z::Float64
+
+    # Velocity
+    vx::Float64
+    vy::Float64
+    vz::Float64
+
+    # Object orientation
+    yaw::Float64
+
+    # Physical properties
+    mass_kg::Float64
+
+    # Destination
+    destination::Int
+
+    # Tracking state
+    confidence::Float64
+    last_update::Float64
+
+    active::Bool
+end
+
+
+# ============================================================
+# ROBOT
+# ============================================================
+
+struct Robot
+    id::Int
+
+    # Robot base position
+    base::Vector{Float64}
+
+    # Maximum reach
+    reach_m::Float64
+
+    # Maximum joint velocity
+    max_joint_speed::Float64
+
+    # Maximum payload
+    max_payload_kg::Float64
+
+    # Time required to grab/place
+    cycle_time_s::Float64
+end
+
+
+# ============================================================
+# PICK PLAN
+# ============================================================
+
+struct PickPlan
+    item_id::Int
+    robot_id::Int
+
+    pickup_time::Float64
+
+    pickup_position::Vector{Float64}
+    pickup_orientation::Float64
+
+    destination::Int
+
+    valid::Bool
+end
+
+
+# ============================================================
+# CONVEYOR
+# ============================================================
+
+mutable struct Conveyor
+
+    length_m::Float64
+    width_m::Float64
+
+    belt_speed::Float64
+
+    items::Dict{Int,Item}
+
+    robots::Vector{Robot}
+
+    next_item_id::Int
+end
+
+
+# ============================================================
+# CREATE CONVEYOR
+# ============================================================
+
+function Conveyor(
+    length_m,
+    width_m,
+    belt_speed,
+    robots
+)
+
+    Conveyor(
+        length_m,
+        width_m,
+        belt_speed,
+        Dict{Int,Item}(),
+        robots,
+        1
+    )
+end
+
+
+# ============================================================
+# ADD DETECTED ITEM
+# ============================================================
+
+function register_item!(
+    conveyor::Conveyor,
+    x,
+    y,
+    z,
+    mass,
+    destination;
+    yaw = 0.0,
+    confidence = 1.0,
+    timestamp = 0.0
+)
+
+    id = conveyor.next_item_id
+
+    conveyor.next_item_id += 1
+
+    conveyor.items[id] =
+        Item(
+            id,
+            x,
+            y,
+            z,
+            conveyor.belt_speed,
+            0.0,
+            0.0,
+            yaw,
+            mass,
+            destination,
+            confidence,
+            timestamp,
+            true
+        )
+
+    return id
+end
+
+
+# ============================================================
+# UPDATE ITEM POSITION
+# ============================================================
+
+function update_item!(
+    item::Item,
+    timestamp,
+    measured_x,
+    measured_y,
+    measured_z
+)
+
+    dt =
+        timestamp -
+        item.last_update
+
+    if dt <= 0
+        return
+    end
+
+    # Estimate velocity from sensor observations
+
+    item.vx =
+        (measured_x - item.x) / dt
+
+    item.vy =
+        (measured_y - item.y) / dt
+
+    item.vz =
+        (measured_z - item.z) / dt
+
+    item.x = measured_x
+    item.y = measured_y
+    item.z = measured_z
+
+    item.last_update =
+        timestamp
+end
+
+
+# ============================================================
+# PREDICT ITEM POSITION
+# ============================================================
+
+function predict_position(
+    item::Item,
+    future_time::Float64
+)
+
+    return [
+        item.x + item.vx * future_time,
+        item.y + item.vy * future_time,
+        item.z + item.vz * future_time
+    ]
+
+end
+
+
+# ============================================================
+# TIME UNTIL PICKUP ZONE
+# ============================================================
+
+function time_to_pick_zone(
+    item::Item,
+    pickup_x::Float64
+)
+
+    distance =
+        pickup_x - item.x
+
+    if item.vx <= 0
+        return Inf
+    end
+
+    if distance < 0
+        return Inf
+    end
+
+    return distance / item.vx
+end
+
+
+# ============================================================
+# ROBOT REACHABILITY
+# ============================================================
+
+function reachable(
+    robot::Robot,
+    position::Vector{Float64}
+)
+
+    distance =
+        norm(
+            position -
+            robot.base
+        )
+
+    return distance <=
+           robot.reach_m
+end
+
+
+# ============================================================
+# ROBOT SELECTION
+# ============================================================
+
+function select_robot(
+    conveyor::Conveyor,
+    item::Item,
+    pickup_position::Vector{Float64}
+)
+
+    best_robot = nothing
+    best_score = Inf
+
+    for robot in conveyor.robots
+
+        # Payload constraint
+
+        if item.mass_kg >
+           robot.max_payload_kg
+
+            continue
+        end
+
+        # Reach constraint
+
+        if !reachable(
+            robot,
+            pickup_position
+        )
+
+            continue
+        end
+
+        distance =
+            norm(
+                pickup_position -
+                robot.base
+            )
+
+        score =
+            distance +
+            robot.cycle_time_s
+
+        if score < best_score
+
+            best_score = score
+            best_robot = robot
+
+        end
+    end
+
+    return best_robot
+end
+
+
+# ============================================================
+# CREATE PICK PLAN
+# ============================================================
+
+function plan_pick(
+    conveyor::Conveyor,
+    item_id::Int,
+    pickup_x::Float64,
+    current_time::Float64
+)
+
+    item =
+        conveyor.items[item_id]
+
+    time_to_pick =
+        time_to_pick_zone(
+            item,
+            pickup_x
+        )
+
+    if !isfinite(time_to_pick)
+
+        return nothing
+    end
+
+    pickup_time =
+        current_time +
+        time_to_pick
+
+    position =
+        predict_position(
+            item,
+            time_to_pick
+        )
+
+    robot =
+        select_robot(
+            conveyor,
+            item,
+            position
+        )
+
+    if robot === nothing
+        return nothing
+    end
+
+    return PickPlan(
+        item.id,
+        robot.id,
+        pickup_time,
+        position,
+        item.yaw,
+        item.destination,
+        true
+    )
+end
+
+
+# ============================================================
+# CONTINUOUS CONVEYOR SIMULATION
+# ============================================================
+
+function advance!(
+    conveyor::Conveyor,
+    dt
+)
+
+    for item in values(conveyor.items)
+
+        if !item.active
+            continue
+        end
+
+        item.x +=
+            item.vx * dt
+
+        item.y +=
+            item.vy * dt
+
+        item.z +=
+            item.vz * dt
+
+        # Item has left conveyor
+
+        if item.x >
+           conveyor.length_m
+
+            item.active = false
+
+        end
+    end
+end
+
+
+# ============================================================
+# PREDICTIVE MULTI-ITEM SCHEDULER
+# ============================================================
+
+function schedule_picks(
+    conveyor::Conveyor,
+    pickup_x,
+    current_time
+)
+
+    plans = PickPlan[]
+
+    active_items =
+        filter(
+            x -> x.second.active,
+            conveyor.items
+        )
+
+    # Earliest pickup first
+
+    sorted_items =
+        sort(
+            [x.second for x in active_items],
+            by = item ->
+                time_to_pick_zone(
+                    item,
+                    pickup_x
+                )
+        )
+
+    robot_available =
+        Dict(
+            robot.id => current_time
+            for robot in conveyor.robots
+        )
+
+    for item in sorted_items
+
+        plan =
+            plan_pick(
+                conveyor,
+                item.id,
+                pickup_x,
+                current_time
+            )
+
+        if plan === nothing
+            continue
+        end
+
+        robot_time =
+            robot_available[
+                plan.robot_id
+            ]
+
+        # Robot must be available before pickup
+
+        if robot_time <=
+           plan.pickup_time
+
+            push!(
+                plans,
+                plan
+            )
+
+            robot_available[
+                plan.robot_id
+            ] =
+                plan.pickup_time +
+                conveyor.robots[
+                    findfirst(
+                        r -> r.id ==
+                        plan.robot_id,
+                        conveyor.robots
+                    )
+                ].cycle_time_s
+        end
+    end
+
+    return plans
+end
+
+
+# ============================================================
+# STATUS
+# ============================================================
+
+function status(conveyor)
+
+    println(
+        "CONVEYOR STATUS"
+    )
+
+    println(
+        "Speed: ",
+        conveyor.belt_speed,
+        " m/s"
+    )
+
+    println(
+        "Tracked items: ",
+        length(conveyor.items)
+    )
+
+    for item in values(conveyor.items)
+
+        if item.active
+
+            println(
+                "Item ",
+                item.id,
+                " | x=",
+                round(item.x, digits=3),
+                " | y=",
+                round(item.y, digits=3),
+                " | destination=",
+                item.destination
+            )
+
+        end
+    end
+end
+
+end # module
+
+
+# ============================================================
+# EXAMPLE
+# ============================================================
+
+using .ConveyorRobotCoordinator
+
+robots = [
+
+    Robot(
+        1,
+        [4.0, -1.5, 1.0],
+        2.5,
+        5.0,
+        20.0,
+        1.2
+    ),
+
+    Robot(
+        2,
+        [4.0, 1.5, 1.0],
+        2.5,
+        5.0,
+        20.0,
+        1.2
+    )
+]
+
+
+conveyor =
+    Conveyor(
+        20.0,     # length
+        3.0,      # width
+        1.2,      # belt speed
+        robots
+    )
+
+
+# Camera detects objects
+
+register_item!(
+    conveyor,
+    0.5,
+    0.3,
+    0.8,
+    2.0,
+    7
+)
+
+
+register_item!(
+    conveyor,
+    1.7,
+    -0.4,
+    0.8,
+    4.0,
+    3
+)
+
+
+register_item!(
+    conveyor,
+    3.2,
+    0.8,
+    0.8,
+    1.5,
+    4
+)
+
+
+# Pick station
+
+pickup_x = 4.0
+
+current_time = 0.0
+
+
+plans =
+    schedule_picks(
+        conveyor,
+        pickup_x,
+        current_time
+    )
+
+
+for plan in plans
+
+    println()
+
+    println(
+        "ROBOT PICK PLAN"
+    )
+
+    println(
+        "Item: ",
+        plan.item_id
+    )
+
+    println(
+        "Robot: ",
+        plan.robot_id
+    )
+
+    println(
+        "Pickup time: ",
+        round(
+            plan.pickup_time,
+            digits=3
+        ),
+        " s"
+    )
+
+    println(
+        "Pickup position: ",
+        round.(
+            plan.pickup_position,
+            digits=3
+        )
+    )
+
+    println(
+        "Destination: ",
+        plan.destination
+    )
+
+end
+```
+
+
+
