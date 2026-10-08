@@ -1,0 +1,49 @@
+struct GrindObservation
+    gap::Float64
+    rpm::Float64
+    dose::Float64
+    brew_time::Float64
+    flow_rate::Float64
+    tds::Float64
+    extraction::Float64
+    sensory_score::Float64
+end
+
+
+function sensory_objective(
+    extraction,
+    sensory_score
+)
+
+    return (
+        0.55 * extraction +
+        0.45 * sensory_score
+    )
+
+end
+
+
+function learn_from_brew(
+    observations::Vector{GrindObservation}
+)
+
+    # Estimate the relationship between
+    # grinder parameters and cup quality.
+
+    scores =
+        [
+            sensory_objective(
+                x.extraction,
+                x.sensory_score
+            )
+            for x in observations
+        ]
+
+    best_index =
+        argmax(scores)
+
+    return observations[
+        best_index
+    ]
+end
+
